@@ -1,12 +1,12 @@
 // arena.rs
 use crate::join_adapters::*;
-use crate::nodes::{ConditionalNode, FilterNode, FlatMapNode, FromNode, GroupNode, JoinNode};
-use crate::{AnyTuple, TupleArity, TupleState};
+use crate::nodes::{ConditionalNode, FilterNode, FlatMapNode, FromNode, GroupNode, JoinNode, ScoringNode};
 use crate::score::Score;
+use crate::state::TupleState;
+use crate::tuple::{AnyTuple, TupleArity};
 use generational_arena::{Arena, Index as TupleIndex};
 use slotmap::{DefaultKey, SlotMap};
 use std::collections::HashMap;
-use crate::nodes::ScoringNode;
 
 pub type NodeId = DefaultKey;
 
@@ -75,36 +75,136 @@ impl TupleArena {
 
     pub fn get_tuple(&self, safe_index: SafeTupleIndex) -> Option<&AnyTuple> {
         // Verify generation
-        if let Some(&expected_gen) = self.active_refs.get(&safe_index.index) {
-            if expected_gen != safe_index.generation {
-                return None;
-            }
+        if self
+            .active_refs
+            .get(&safe_index.index)
+            .map_or(false, |&gen| gen == safe_index.generation)
+        {
+            self.arena.get(safe_index.index)
         } else {
-            return None;
+            None
         }
-
-        self.arena.get(safe_index.index)
     }
 
     pub fn get_tuple_mut(&mut self, safe_index: SafeTupleIndex) -> Option<&mut AnyTuple> {
         // Verify generation
-        if let Some(&expected_gen) = self.active_refs.get(&safe_index.index) {
-            if expected_gen != safe_index.generation {
-                return None;
-            }
+        if self
+            .active_refs
+            .get(&safe_index.index)
+            .map_or(false, |&gen| gen == safe_index.generation)
+        {
+            self.arena.get_mut(safe_index.index)
         } else {
-            return None;
+            None
         }
-
-        self.arena.get_mut(safe_index.index)
     }
 
     pub fn release_tuple(&mut self, safe_index: SafeTupleIndex) {
+        // Verify the tuple exists and is in the expected state
         if let Some(tuple) = self.get_tuple_mut(safe_index) {
+            // Only release if it's in a dying or dead state
+            if !matches!(tuple.state(), TupleState::Dying | TupleState::Dead) {
+                eprintln!(
+                    "Warning: Releasing tuple in unexpected state: {:?}",
+                    tuple.state()
+                );
+            }
+
             let arity = tuple.tuple_arity();
-            tuple.reset();
+            tuple.reset(); // This sets state to Dead and clears node reference
+
+            // Return to pool for reuse
             self.type_pools.entry(arity).or_default().push(safe_index);
+            self.active_refs.remove(&safe_index.index);
+        } else {
+            eprintln!(
+                "Warning: Attempted to release invalid tuple: {:?}",
+                safe_index
+            );
         }
+    }
+
+    // FIXED: Add method to force cleanup of all dying tuples
+    pub fn cleanup_dying_tuples(&mut self) -> usize {
+        let mut cleaned_count = 0;
+        let mut indices_to_clean = Vec::new();
+
+        // Find all dying tuples
+        for (index, tuple) in self.arena.iter() {
+            if matches!(tuple.state(), TupleState::Dying) {
+                if let Some(&generation) = self.active_refs.get(&index) {
+                    indices_to_clean.push(SafeTupleIndex::new(index, generation));
+                }
+            }
+        }
+
+        // Clean them up
+        for safe_index in indices_to_clean {
+            self.release_tuple(safe_index);
+            cleaned_count += 1;
+        }
+
+        cleaned_count
+    }
+}
+
+#[cfg(debug_assertions)]
+impl TupleArena {
+    pub fn check_for_leaks(&self) -> Result<(), String> {
+        let mut live_count = 0;
+        let mut dead_count = 0;
+        let mut dying_count = 0;
+
+        for (_, tuple) in self.arena.iter() {
+            match tuple.state() {
+                TupleState::Dead => dead_count += 1,
+                TupleState::Dying => dying_count += 1,
+                _ => live_count += 1,
+            }
+        }
+
+        let pooled_count: usize = self.type_pools.values().map(|v| v.len()).sum();
+
+        if dying_count > 0 {
+            return Err(format!(
+                "Found {} tuples in Dying state that should be cleaned up",
+                dying_count
+            ));
+        }
+
+        if dead_count != pooled_count {
+            return Err(format!(
+                "Inconsistency: {} dead tuples but {} pooled tuples",
+                dead_count, pooled_count
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub fn get_memory_stats(&self) -> String {
+        let mut live_count = 0;
+        let mut dead_count = 0;
+        let mut dying_count = 0;
+
+        for (_, tuple) in self.arena.iter() {
+            match tuple.state() {
+                TupleState::Dead => dead_count += 1,
+                TupleState::Dying => dying_count += 1,
+                _ => live_count += 1,
+            }
+        }
+
+        let pooled_count: usize = self.type_pools.values().map(|v| v.len()).sum();
+
+        format!(
+            "Arena Stats: {} live, {} dead, {} dying, {} pooled, {} total slots",
+            live_count,
+            dead_count,
+            dying_count,
+            pooled_count,
+            self.arena.len()
+        )
     }
 }
 
@@ -115,7 +215,7 @@ impl std::fmt::Debug for TupleArena {
             let pool_size = self.type_pools.get(arity).map(|v| v.len()).unwrap_or(0);
             arity_counts.insert(format!("Arity{:?}", arity), pool_size);
         }
-        
+
         f.debug_struct("TupleArena")
             .field("total_arena_slots", &self.arena.len())
             .field("generation_counter", &self.generation_counter)
@@ -139,6 +239,8 @@ pub enum NodeOperation {
     InsertRight(NodeId, SafeTupleIndex),
     RetractLeft(NodeId, SafeTupleIndex),
     RetractRight(NodeId, SafeTupleIndex),
+    // NEW: Explicit tuple release operation
+    ReleaseTuple(SafeTupleIndex),
 }
 
 #[derive(Debug)]
@@ -155,7 +257,12 @@ pub enum NodeData<S: Score> {
 }
 
 impl<S: Score> NodeData<S> {
-    pub fn collect_insert_ops(&mut self, tuple_index: SafeTupleIndex, tuples: &mut TupleArena, operations: &mut Vec<NodeOperation>) {
+    pub fn collect_insert_ops(
+        &mut self,
+        tuple_index: SafeTupleIndex,
+        tuples: &mut TupleArena,
+        operations: &mut Vec<NodeOperation>,
+    ) {
         match self {
             NodeData::From(node) => node.insert_collect_ops(tuple_index, tuples, operations),
             NodeData::Filter(node) => node.insert_collect_ops(tuple_index, tuples, operations),
@@ -165,16 +272,27 @@ impl<S: Score> NodeData<S> {
                 // Join and Conditional nodes cannot be inserted directly
             }
             NodeData::JoinLeftAdapter(adapter) => {
-                operations.push(NodeOperation::InsertLeft(adapter.parent_join_node, tuple_index));
+                operations.push(NodeOperation::InsertLeft(
+                    adapter.parent_join_node,
+                    tuple_index,
+                ));
             }
             NodeData::JoinRightAdapter(adapter) => {
-                operations.push(NodeOperation::InsertRight(adapter.parent_join_node, tuple_index));
+                operations.push(NodeOperation::InsertRight(
+                    adapter.parent_join_node,
+                    tuple_index,
+                ));
             }
             NodeData::Scoring(node) => node.insert_collect_ops(tuple_index, tuples, operations),
         }
     }
 
-    pub fn collect_retract_ops(&mut self, tuple_index: SafeTupleIndex, tuples: &mut TupleArena, operations: &mut Vec<NodeOperation>) {
+    pub fn collect_retract_ops(
+        &mut self,
+        tuple_index: SafeTupleIndex,
+        tuples: &mut TupleArena,
+        operations: &mut Vec<NodeOperation>,
+    ) {
         match self {
             NodeData::From(node) => node.retract_collect_ops(tuple_index, tuples, operations),
             NodeData::Filter(node) => node.retract_collect_ops(tuple_index, tuples, operations),
@@ -184,10 +302,16 @@ impl<S: Score> NodeData<S> {
                 // Join and Conditional nodes cannot be retracted directly
             }
             NodeData::JoinLeftAdapter(adapter) => {
-                operations.push(NodeOperation::RetractLeft(adapter.parent_join_node, tuple_index));
+                operations.push(NodeOperation::RetractLeft(
+                    adapter.parent_join_node,
+                    tuple_index,
+                ));
             }
             NodeData::JoinRightAdapter(adapter) => {
-                operations.push(NodeOperation::RetractRight(adapter.parent_join_node, tuple_index));
+                operations.push(NodeOperation::RetractRight(
+                    adapter.parent_join_node,
+                    tuple_index,
+                ));
             }
             NodeData::Scoring(node) => node.retract_collect_ops(tuple_index, tuples, operations),
         }
@@ -201,7 +325,9 @@ impl<S: Score> NodeData<S> {
             NodeData::Conditional(n) => &mut n.children,
             NodeData::Group(n) => &mut n.children,
             NodeData::FlatMap(n) => &mut n.children,
-            NodeData::Scoring(_) | NodeData::JoinLeftAdapter(_) | NodeData::JoinRightAdapter(_) => return,
+            NodeData::Scoring(_)
+            | NodeData::JoinLeftAdapter(_)
+            | NodeData::JoinRightAdapter(_) => return,
         };
         if !children.contains(&child_id) {
             children.push(child_id);
@@ -215,7 +341,9 @@ pub struct NodeArena<S: Score> {
 
 impl<S: Score> NodeArena<S> {
     pub fn new() -> Self {
-        Self { nodes: SlotMap::new() }
+        Self {
+            nodes: SlotMap::new(),
+        }
     }
 
     pub fn insert_node(&mut self, node_data: NodeData<S>) -> NodeId {
@@ -234,9 +362,26 @@ impl<S: Score> NodeArena<S> {
         self.nodes.len()
     }
 
-    pub fn execute_operations(mut operations: Vec<NodeOperation>, nodes: &mut NodeArena<S>, tuples: &mut TupleArena) {
-        while !operations.is_empty() {
-            let current_batch = std::mem::take(&mut operations);
+    pub fn execute_operations(
+        mut operations: Vec<NodeOperation>,
+        nodes: &mut NodeArena<S>,
+        tuples: &mut TupleArena,
+    ) {
+        // Separate node operations from release operations for proper ordering
+        let mut node_ops = Vec::new();
+        let mut release_ops = Vec::new();
+
+        // Initial separation
+        for op in operations.drain(..) {
+            match op {
+                NodeOperation::ReleaseTuple(idx) => release_ops.push(idx),
+                other => node_ops.push(other),
+            }
+        }
+
+        // Process all node operations first (these may generate more operations)
+        while !node_ops.is_empty() {
+            let current_batch = std::mem::take(&mut node_ops);
             for operation in current_batch {
                 let mut new_operations = Vec::new();
                 match operation {
@@ -278,9 +423,25 @@ impl<S: Score> NodeArena<S> {
                             n.retract_right_collect_ops(tuple_index, tuples, &mut new_operations);
                         }
                     }
+                    NodeOperation::ReleaseTuple(idx) => {
+                        // This shouldn't happen here, but handle it
+                        release_ops.push(idx);
+                    }
                 }
-                operations.extend(new_operations);
+
+                // Separate new operations
+                for new_op in new_operations {
+                    match new_op {
+                        NodeOperation::ReleaseTuple(idx) => release_ops.push(idx),
+                        other => node_ops.push(other),
+                    }
+                }
             }
+        }
+
+        // CRITICAL: Now release all marked tuples after all operations complete
+        for tuple_idx in release_ops {
+            tuples.release_tuple(tuple_idx);
         }
     }
 }
@@ -291,7 +452,7 @@ impl<S: Score> std::fmt::Debug for NodeArena<S> {
         for (_, node_data) in self.nodes.iter() {
             let node_type = match node_data {
                 NodeData::From(_) => "From",
-                NodeData::Filter(_) => "Filter", 
+                NodeData::Filter(_) => "Filter",
                 NodeData::Join(_) => "Join",
                 NodeData::Conditional(_) => "Conditional",
                 NodeData::JoinLeftAdapter(_) => "JoinLeftAdapter",
@@ -302,7 +463,7 @@ impl<S: Score> std::fmt::Debug for NodeArena<S> {
             };
             *node_counts.entry(node_type).or_insert(0) += 1;
         }
-        
+
         f.debug_struct("NodeArena")
             .field("total_nodes", &self.nodes.len())
             .field("node_type_counts", &node_counts)

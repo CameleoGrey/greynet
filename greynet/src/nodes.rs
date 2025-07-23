@@ -1,22 +1,24 @@
 //nodes.rs
 use super::advanced_index::AdvancedIndex;
 use super::arena::{NodeId, NodeOperation, SafeTupleIndex, TupleArena};
-use super::collectors::BaseCollector;
+use super::collectors::{BaseCollector, UndoFunction};
 use super::joiner::JoinerType;
 use super::tuple::BiTuple;
 use super::uni_index::UniIndex;
-use crate::AnyTuple;
+use crate::constraint::ConstraintWeights;
+use crate::score::Score;
+use crate::state::TupleState;
+use crate::tuple::AnyTuple;
 use std::any::TypeId;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::cell::RefCell;
-use crate::{Score, constraint::ConstraintWeights};
-use crate::collectors::UndoFunction;
 
 pub type SharedImpactFn<S> = Rc<dyn Fn(&crate::tuple::AnyTuple) -> S>;
 pub type SharedKeyFn = Rc<dyn Fn(&AnyTuple) -> u64>;
 pub type SharedPredicate = Rc<dyn Fn(&AnyTuple) -> bool>;
-pub type SharedMapperFn = Rc<dyn Fn(&crate::tuple::AnyTuple) -> Vec<Rc<dyn crate::fact::GreynetFact>>>;
+pub type SharedMapperFn =
+    Rc<dyn Fn(&crate::tuple::AnyTuple) -> Vec<Rc<dyn crate::fact::GreynetFact>>>;
 
 #[derive(Debug)]
 pub struct FromNode {
@@ -26,16 +28,29 @@ pub struct FromNode {
 
 impl FromNode {
     pub fn new(fact_type: TypeId) -> Self {
-        Self { children: Vec::new(), fact_type }
+        Self {
+            children: Vec::new(),
+            fact_type,
+        }
     }
 
-    pub fn insert_collect_ops(&mut self, tuple_index: SafeTupleIndex, _tuples: &mut TupleArena, operations: &mut Vec<NodeOperation>) {
+    pub fn insert_collect_ops(
+        &mut self,
+        tuple_index: SafeTupleIndex,
+        _tuples: &mut TupleArena,
+        operations: &mut Vec<NodeOperation>,
+    ) {
         for &child_id in &self.children {
             operations.push(NodeOperation::Insert(child_id, tuple_index));
         }
     }
 
-    pub fn retract_collect_ops(&mut self, tuple_index: SafeTupleIndex, _tuples: &mut TupleArena, operations: &mut Vec<NodeOperation>) {
+    pub fn retract_collect_ops(
+        &mut self,
+        tuple_index: SafeTupleIndex,
+        _tuples: &mut TupleArena,
+        operations: &mut Vec<NodeOperation>,
+    ) {
         for &child_id in &self.children {
             operations.push(NodeOperation::Retract(child_id, tuple_index));
         }
@@ -49,10 +64,18 @@ pub struct FilterNode {
 
 impl FilterNode {
     pub fn new(predicate: SharedPredicate) -> Self {
-        Self { children: Vec::new(), predicate }
+        Self {
+            children: Vec::new(),
+            predicate,
+        }
     }
 
-    pub fn insert_collect_ops(&mut self, tuple_index: SafeTupleIndex, tuples: &mut TupleArena, operations: &mut Vec<NodeOperation>) {
+    pub fn insert_collect_ops(
+        &mut self,
+        tuple_index: SafeTupleIndex,
+        tuples: &mut TupleArena,
+        operations: &mut Vec<NodeOperation>,
+    ) {
         if let Some(tuple) = tuples.get_tuple(tuple_index) {
             if (self.predicate)(tuple) {
                 for &child_id in &self.children {
@@ -62,7 +85,12 @@ impl FilterNode {
         }
     }
 
-    pub fn retract_collect_ops(&mut self, tuple_index: SafeTupleIndex, tuples: &mut TupleArena, operations: &mut Vec<NodeOperation>) {
+    pub fn retract_collect_ops(
+        &mut self,
+        tuple_index: SafeTupleIndex,
+        tuples: &mut TupleArena,
+        operations: &mut Vec<NodeOperation>,
+    ) {
         if let Some(tuple) = tuples.get_tuple(tuple_index) {
             if (self.predicate)(tuple) {
                 for &child_id in &self.children {
@@ -129,7 +157,11 @@ pub struct JoinNode {
 }
 
 impl JoinNode {
-    pub fn new(joiner_type: JoinerType, left_key_fn: SharedKeyFn, right_key_fn: SharedKeyFn) -> Self {
+    pub fn new(
+        joiner_type: JoinerType,
+        left_key_fn: SharedKeyFn,
+        right_key_fn: SharedKeyFn,
+    ) -> Self {
         Self {
             children: Vec::new(),
             joiner_type,
@@ -141,7 +173,12 @@ impl JoinNode {
         }
     }
 
-    pub fn insert_left_collect_ops(&mut self, tuple_index: SafeTupleIndex, tuples: &mut TupleArena, operations: &mut Vec<NodeOperation>) {
+    pub fn insert_left_collect_ops(
+        &mut self,
+        tuple_index: SafeTupleIndex,
+        tuples: &mut TupleArena,
+        operations: &mut Vec<NodeOperation>,
+    ) {
         let left_tuple = if let Some(t) = tuples.get_tuple(tuple_index) {
             t.clone()
         } else {
@@ -151,7 +188,9 @@ impl JoinNode {
         let key = (self.left_key_fn)(&left_tuple);
         self.left_index.put(key, tuple_index);
 
-        let right_matches = self.right_index.get_matches(key, self.joiner_type.inverse());
+        let right_matches = self
+            .right_index
+            .get_matches(key, self.joiner_type.inverse());
         for &right_match_idx in &right_matches {
             let right_tuple = if let Some(t) = tuples.get_tuple(right_match_idx) {
                 t.clone()
@@ -161,7 +200,8 @@ impl JoinNode {
 
             if let Ok(combined) = left_tuple.combine(&right_tuple) {
                 let child_idx = tuples.acquire_tuple(combined);
-                self.beta_memory.insert((tuple_index, right_match_idx), child_idx);
+                self.beta_memory
+                    .insert((tuple_index, right_match_idx), child_idx);
                 for &child_id in self.children.iter() {
                     operations.push(NodeOperation::Insert(child_id, child_idx));
                 }
@@ -169,7 +209,12 @@ impl JoinNode {
         }
     }
 
-    pub fn insert_right_collect_ops(&mut self, tuple_index: SafeTupleIndex, tuples: &mut TupleArena, operations: &mut Vec<NodeOperation>) {
+    pub fn insert_right_collect_ops(
+        &mut self,
+        tuple_index: SafeTupleIndex,
+        tuples: &mut TupleArena,
+        operations: &mut Vec<NodeOperation>,
+    ) {
         let right_tuple = if let Some(t) = tuples.get_tuple(tuple_index) {
             t.clone()
         } else {
@@ -189,7 +234,8 @@ impl JoinNode {
 
             if let Ok(combined) = left_tuple.combine(&right_tuple) {
                 let child_idx = tuples.acquire_tuple(combined);
-                self.beta_memory.insert((left_match_idx, tuple_index), child_idx);
+                self.beta_memory
+                    .insert((left_match_idx, tuple_index), child_idx);
                 for &child_id in self.children.iter() {
                     operations.push(NodeOperation::Insert(child_id, child_idx));
                 }
@@ -197,42 +243,78 @@ impl JoinNode {
         }
     }
 
-    pub fn retract_left_collect_ops(&mut self, tuple_index: SafeTupleIndex, tuples: &mut TupleArena, operations: &mut Vec<NodeOperation>) {
+    pub fn retract_left_collect_ops(
+        &mut self,
+        tuple_index: SafeTupleIndex,
+        tuples: &mut TupleArena,
+        operations: &mut Vec<NodeOperation>,
+    ) {
+        // Remove from left index
         if let Some(tuple) = tuples.get_tuple(tuple_index) {
             let key = (self.left_key_fn)(tuple);
             self.left_index.remove(key, &tuple_index);
         }
 
-        let pairs_to_remove: Vec<_> = self.beta_memory.keys()
+        // Find all child tuples that need to be removed
+        let pairs_to_remove: Vec<_> = self
+            .beta_memory
+            .keys()
             .filter(|(left, _)| *left == tuple_index)
             .cloned()
             .collect();
 
         for (left_idx, right_idx) in pairs_to_remove {
             if let Some(child_idx) = self.beta_memory.remove(&(left_idx, right_idx)) {
+                // Retract from downstream nodes first
                 for &child_id in self.children.iter() {
                     operations.push(NodeOperation::Retract(child_id, child_idx));
                 }
+
+                // FIXED: Mark child tuple as dying and schedule for release
+                if let Some(child_tuple) = tuples.get_tuple_mut(child_idx) {
+                    child_tuple.set_state(TupleState::Dying);
+                }
+
+                // FIXED: Schedule child tuple for release from arena
+                operations.push(NodeOperation::ReleaseTuple(child_idx));
             }
         }
     }
 
-    pub fn retract_right_collect_ops(&mut self, tuple_index: SafeTupleIndex, tuples: &mut TupleArena, operations: &mut Vec<NodeOperation>) {
+    pub fn retract_right_collect_ops(
+        &mut self,
+        tuple_index: SafeTupleIndex,
+        tuples: &mut TupleArena,
+        operations: &mut Vec<NodeOperation>,
+    ) {
+        // Remove from right index
         if let Some(tuple) = tuples.get_tuple(tuple_index) {
             let key = (self.right_key_fn)(tuple);
             self.right_index.remove(key, &tuple_index);
         }
 
-        let pairs_to_remove: Vec<_> = self.beta_memory.keys()
+        // Find all child tuples that need to be removed
+        let pairs_to_remove: Vec<_> = self
+            .beta_memory
+            .keys()
             .filter(|(_, right)| *right == tuple_index)
             .cloned()
             .collect();
 
         for (left_idx, right_idx) in pairs_to_remove {
             if let Some(child_idx) = self.beta_memory.remove(&(left_idx, right_idx)) {
+                // Retract from downstream nodes first
                 for &child_id in self.children.iter() {
                     operations.push(NodeOperation::Retract(child_id, child_idx));
                 }
+
+                // FIXED: Mark child tuple as dying and schedule for release
+                if let Some(child_tuple) = tuples.get_tuple_mut(child_idx) {
+                    child_tuple.set_state(TupleState::Dying);
+                }
+
+                // FIXED: Schedule child tuple for release from arena
+                operations.push(NodeOperation::ReleaseTuple(child_idx));
             }
         }
     }
@@ -263,7 +345,11 @@ pub struct ConditionalNode {
 }
 
 impl ConditionalNode {
-    pub fn new(should_exist: bool, left_key_fn: SharedKeyFn, right_key_fn: SharedKeyFn) -> Self {
+    pub fn new(
+        should_exist: bool,
+        left_key_fn: SharedKeyFn,
+        right_key_fn: SharedKeyFn,
+    ) -> Self {
         Self {
             children: Vec::new(),
             should_exist,
@@ -275,7 +361,12 @@ impl ConditionalNode {
         }
     }
 
-    pub fn insert_left_collect_ops(&mut self, tuple_index: SafeTupleIndex, tuples: &mut TupleArena, operations: &mut Vec<NodeOperation>) {
+    pub fn insert_left_collect_ops(
+        &mut self,
+        tuple_index: SafeTupleIndex,
+        tuples: &mut TupleArena,
+        operations: &mut Vec<NodeOperation>,
+    ) {
         let key = if let Some(tuple) = tuples.get_tuple(tuple_index) {
             (self.left_key_fn)(tuple)
         } else {
@@ -294,7 +385,12 @@ impl ConditionalNode {
         }
     }
 
-    pub fn insert_right_collect_ops(&mut self, tuple_index: SafeTupleIndex, tuples: &mut TupleArena, operations: &mut Vec<NodeOperation>) {
+    pub fn insert_right_collect_ops(
+        &mut self,
+        tuple_index: SafeTupleIndex,
+        tuples: &mut TupleArena,
+        operations: &mut Vec<NodeOperation>,
+    ) {
         let key = if let Some(tuple) = tuples.get_tuple(tuple_index) {
             (self.right_key_fn)(tuple)
         } else {
@@ -322,7 +418,12 @@ impl ConditionalNode {
         }
     }
 
-    pub fn retract_left_collect_ops(&mut self, tuple_index: SafeTupleIndex, tuples: &mut TupleArena, operations: &mut Vec<NodeOperation>) {
+    pub fn retract_left_collect_ops(
+        &mut self,
+        tuple_index: SafeTupleIndex,
+        tuples: &mut TupleArena,
+        operations: &mut Vec<NodeOperation>,
+    ) {
         let key = if let Some(tuple) = tuples.get_tuple(tuple_index) {
             (self.left_key_fn)(tuple)
         } else {
@@ -340,7 +441,12 @@ impl ConditionalNode {
         }
     }
 
-    pub fn retract_right_collect_ops(&mut self, tuple_index: SafeTupleIndex, tuples: &mut TupleArena, operations: &mut Vec<NodeOperation>) {
+    pub fn retract_right_collect_ops(
+        &mut self,
+        tuple_index: SafeTupleIndex,
+        tuples: &mut TupleArena,
+        operations: &mut Vec<NodeOperation>,
+    ) {
         let key = if let Some(tuple) = tuples.get_tuple(tuple_index) {
             (self.right_key_fn)(tuple)
         } else {
@@ -394,7 +500,10 @@ pub struct GroupNode {
 }
 
 impl GroupNode {
-    pub fn new(key_fn: SharedKeyFn, collector_supplier: Rc<dyn Fn() -> Box<dyn BaseCollector>>) -> Self {
+    pub fn new(
+        key_fn: SharedKeyFn,
+        collector_supplier: Rc<dyn Fn() -> Box<dyn BaseCollector>>,
+    ) -> Self {
         Self {
             children: Vec::new(),
             key_fn,
@@ -405,7 +514,12 @@ impl GroupNode {
         }
     }
 
-    pub fn insert_collect_ops(&mut self, tuple_index: SafeTupleIndex, tuples: &mut TupleArena, operations: &mut Vec<NodeOperation>) {
+    pub fn insert_collect_ops(
+        &mut self,
+        tuple_index: SafeTupleIndex,
+        tuples: &mut TupleArena,
+        operations: &mut Vec<NodeOperation>,
+    ) {
         let parent_tuple = if let Some(t) = tuples.get_tuple(tuple_index) {
             t
         } else {
@@ -413,31 +527,55 @@ impl GroupNode {
         };
 
         let key = (self.key_fn)(parent_tuple);
-        let collector = self.groups.entry(key).or_insert_with(|| (self.collector_supplier)());
+        let collector = self
+            .groups
+            .entry(key)
+            .or_insert_with(|| (self.collector_supplier)());
         let undo_fn = collector.insert(parent_tuple);
         self.tuple_to_undo.insert(tuple_index, (key, undo_fn));
         self.update_or_create_child(key, tuples, operations);
     }
 
-    pub fn retract_collect_ops(&mut self, tuple_index: SafeTupleIndex, tuples: &mut TupleArena, operations: &mut Vec<NodeOperation>) {
+    pub fn retract_collect_ops(
+        &mut self,
+        tuple_index: SafeTupleIndex,
+        tuples: &mut TupleArena,
+        operations: &mut Vec<NodeOperation>,
+    ) {
         if let Some((key, undo_fn)) = self.tuple_to_undo.remove(&tuple_index) {
             undo_fn.execute();
             let is_empty = self.groups.get(&key).map_or(true, |c| c.is_empty());
 
             if is_empty {
+                // Group is now empty, remove the aggregate tuple
                 if let Some(child_tuple_index) = self.group_key_to_tuple.remove(&key) {
+                    // Retract from downstream
                     for &child_id in self.children.iter() {
                         operations.push(NodeOperation::Retract(child_id, child_tuple_index));
                     }
+
+                    // FIXED: Mark aggregate as dying and schedule for release
+                    if let Some(child_tuple) = tuples.get_tuple_mut(child_tuple_index) {
+                        child_tuple.set_state(TupleState::Dying);
+                    }
+
+                    // FIXED: Schedule aggregate for release from arena
+                    operations.push(NodeOperation::ReleaseTuple(child_tuple_index));
                 }
                 self.groups.remove(&key);
             } else {
+                // Group still has items, update the aggregate
                 self.update_or_create_child(key, tuples, operations);
             }
         }
     }
 
-    fn update_or_create_child(&mut self, key: u64, tuples: &mut TupleArena, operations: &mut Vec<NodeOperation>) {
+    fn update_or_create_child(
+        &mut self,
+        key: u64,
+        tuples: &mut TupleArena,
+        operations: &mut Vec<NodeOperation>,
+    ) {
         let new_result_fact = {
             let collector = if let Some(c) = self.groups.get_mut(&key) {
                 c
@@ -447,27 +585,40 @@ impl GroupNode {
             collector.result_as_fact()
         };
 
-        if let Some(&child_tuple_index) = self.group_key_to_tuple.get(&key) {
-            let child_tuple = tuples.get_tuple(child_tuple_index).unwrap();
-            let old_result_fact = match child_tuple {
+        // Check if we need to update existing aggregate
+        if let Some(&old_child_index) = self.group_key_to_tuple.get(&key) {
+            let old_tuple = tuples.get_tuple(old_child_index).unwrap();
+            let old_result_fact = match old_tuple {
                 AnyTuple::Bi(t) => t.fact_b.clone(),
                 _ => panic!("GroupNode child should be BiTuple"),
             };
 
+            // Only update if result actually changed
             if old_result_fact.eq_fact(&*new_result_fact) {
                 return;
             }
 
+            // Retract old aggregate from downstream nodes
             for &child_id in self.children.iter() {
-                operations.push(NodeOperation::Retract(child_id, child_tuple_index));
+                operations.push(NodeOperation::Retract(child_id, old_child_index));
             }
+
+            // FIXED: Mark old aggregate as dying and schedule for release
+            if let Some(old_tuple_mut) = tuples.get_tuple_mut(old_child_index) {
+                old_tuple_mut.set_state(TupleState::Dying);
+            }
+
+            // FIXED: Schedule old aggregate for release from arena
+            operations.push(NodeOperation::ReleaseTuple(old_child_index));
         }
 
+        // Create new aggregate tuple
         let key_fact: Rc<dyn crate::fact::GreynetFact> = Rc::new(key);
         let new_child_tuple = AnyTuple::Bi(BiTuple::new(key_fact, new_result_fact));
         let new_child_index = tuples.acquire_tuple(new_child_tuple);
         self.group_key_to_tuple.insert(key, new_child_index);
 
+        // Insert new aggregate into downstream nodes
         for &child_id in self.children.iter() {
             operations.push(NodeOperation::Insert(child_id, new_child_index));
         }
@@ -500,7 +651,12 @@ impl FlatMapNode {
         }
     }
 
-    pub fn insert_collect_ops(&mut self, parent_tuple_idx: SafeTupleIndex, tuples: &mut TupleArena, operations: &mut Vec<NodeOperation>) {
+    pub fn insert_collect_ops(
+        &mut self,
+        parent_tuple_idx: SafeTupleIndex,
+        tuples: &mut TupleArena,
+        operations: &mut Vec<NodeOperation>,
+    ) {
         let parent_tuple = if let Some(tuple) = tuples.get_tuple(parent_tuple_idx) {
             tuple
         } else {
@@ -521,15 +677,30 @@ impl FlatMapNode {
                 operations.push(NodeOperation::Insert(child_id, child_idx));
             }
         }
-        self.parent_to_children_map.insert(parent_tuple_idx, child_indices);
+        self.parent_to_children_map
+            .insert(parent_tuple_idx, child_indices);
     }
 
-    pub fn retract_collect_ops(&mut self, parent_tuple_idx: SafeTupleIndex, _tuples: &mut TupleArena, operations: &mut Vec<NodeOperation>) {
+    pub fn retract_collect_ops(
+        &mut self,
+        parent_tuple_idx: SafeTupleIndex,
+        tuples: &mut TupleArena,
+        operations: &mut Vec<NodeOperation>,
+    ) {
         if let Some(child_indices) = self.parent_to_children_map.remove(&parent_tuple_idx) {
             for child_idx in child_indices {
+                // Retract from downstream nodes first
                 for &child_id in self.children.iter() {
                     operations.push(NodeOperation::Retract(child_id, child_idx));
                 }
+
+                // FIXED: Mark child tuple as dying and schedule for release
+                if let Some(child_tuple) = tuples.get_tuple_mut(child_idx) {
+                    child_tuple.set_state(TupleState::Dying);
+                }
+
+                // FIXED: Schedule child tuple for release from arena
+                operations.push(NodeOperation::ReleaseTuple(child_idx));
             }
         }
     }
@@ -552,7 +723,11 @@ pub struct ScoringNode<S: Score> {
 }
 
 impl<S: Score> ScoringNode<S> {
-    pub fn new(constraint_id: String, penalty_function: SharedImpactFn<S>, weights: Rc<RefCell<ConstraintWeights>>) -> Self {
+    pub fn new(
+        constraint_id: String,
+        penalty_function: SharedImpactFn<S>,
+        weights: Rc<RefCell<ConstraintWeights>>,
+    ) -> Self {
         Self {
             constraint_id,
             penalty_function,
@@ -561,7 +736,12 @@ impl<S: Score> ScoringNode<S> {
         }
     }
 
-    pub fn insert_collect_ops(&mut self, tuple_index: SafeTupleIndex, tuples: &mut TupleArena, _operations: &mut Vec<NodeOperation>) {
+    pub fn insert_collect_ops(
+        &mut self,
+        tuple_index: SafeTupleIndex,
+        tuples: &mut TupleArena,
+        _operations: &mut Vec<NodeOperation>,
+    ) {
         if let Some(tuple) = tuples.get_tuple(tuple_index) {
             let base_score = (self.penalty_function)(tuple);
             let weight = self.weights.borrow().get_weight(&self.constraint_id);
@@ -570,12 +750,19 @@ impl<S: Score> ScoringNode<S> {
         }
     }
 
-    pub fn retract_collect_ops(&mut self, tuple_index: SafeTupleIndex, _tuples: &mut TupleArena, _operations: &mut Vec<NodeOperation>) {
+    pub fn retract_collect_ops(
+        &mut self,
+        tuple_index: SafeTupleIndex,
+        _tuples: &mut TupleArena,
+        _operations: &mut Vec<NodeOperation>,
+    ) {
         self.matches.remove(&tuple_index);
     }
 
     pub fn get_total_score(&self) -> S {
-        self.matches.values().fold(S::null_score(), |acc, score| acc + score.clone())
+        self.matches
+            .values()
+            .fold(S::null_score(), |acc, score| acc + score.clone())
     }
 
     pub fn recalculate_scores(&mut self, tuples: &TupleArena) {

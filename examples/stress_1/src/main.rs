@@ -489,7 +489,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Configuration
     const NUM_CUSTOMERS: usize = 10_000;
-    const NUM_TRANSACTIONS: usize = 100_000;
+    const NUM_TRANSACTIONS: usize = 10_000_000;
     const NUM_LOCATIONS: usize = 1_000;
     
     // 1. Setup Phase & Initial State

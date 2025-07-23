@@ -1,3 +1,4 @@
+//ergonomic_builders.rs
 use crate::stream_def::{Stream, Arity1, Arity2};
 use crate::nodes::{SharedKeyFn, SharedPredicate};
 use crate::joiner::JoinerType;

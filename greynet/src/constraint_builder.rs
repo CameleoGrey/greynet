@@ -1,3 +1,4 @@
+//constraint_builder.rs
 use crate::factory::ConstraintFactory;
 use crate::stream_def::{Stream, Arity1, ConstraintRecipe};
 use crate::{GreynetFact, Score, constraint::ConstraintWeights};

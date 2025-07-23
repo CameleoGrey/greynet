@@ -1,12 +1,16 @@
-use crate::arena::{NodeArena, SafeTupleIndex, TupleArena, NodeId, NodeData};
+//session.rs
+use crate::arena::{NodeArena, NodeData, NodeId, SafeTupleIndex, TupleArena};
+use crate::constraint::ConstraintWeights;
 use crate::scheduler::BatchScheduler;
-use crate::{AnyTuple, GreynetFact, Score, constraint::ConstraintWeights};
-use crate::tuple::UniTuple;
-use std::rc::Rc;
+use crate::score::Score;
+use crate::state::TupleState;
+use crate::tuple::{AnyTuple, UniTuple};
+use crate::GreynetFact;
+use std::any::TypeId;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::any::TypeId;
+use std::rc::Rc;
 
 #[derive(Debug)]
 pub struct Session<S: Score> {
@@ -42,28 +46,6 @@ impl<S: Score + 'static> Session<S> {
         }
     }
 
-    pub fn clear(&mut self) -> Result<(), String> {
-        // Collect all tuple indices from the map. We collect them into a new Vec
-        // to avoid borrowing issues while we modify the scheduler and map.
-        let tuple_indices_to_retract: Vec<SafeTupleIndex> = self.fact_to_tuple_map.borrow().values().cloned().collect();
-    
-        // Clear the map before scheduling.
-        self.fact_to_tuple_map.borrow_mut().clear();
-    
-        // Schedule all retractions within a new scope to manage borrows.
-        {
-            let mut scheduler = self.scheduler.borrow_mut();
-            let mut tuples = self.tuples.borrow_mut();
-            for index in tuple_indices_to_retract {
-                // This schedules the tuple to be marked as Dying and processed by the scheduler.
-                scheduler.schedule_retract(index, &mut tuples)?;
-            }
-        }
-    
-        // Process all the pending retractions.
-        self.flush()
-    }
-
     pub fn insert<T: GreynetFact + 'static>(&mut self, fact: T) -> Result<(), String> {
         let fact_id = fact.fact_id();
         let fact_type_id = TypeId::of::<T>();
@@ -74,7 +56,9 @@ impl<S: Score + 'static> Session<S> {
         }
 
         // Find appropriate from node
-        let from_node_id = *self.from_nodes.get(&fact_type_id)
+        let from_node_id = *self
+            .from_nodes
+            .get(&fact_type_id)
             .ok_or_else(|| format!("No 'from' node registered for type {:?}", fact_type_id))?;
 
         // Create tuple
@@ -87,10 +71,14 @@ impl<S: Score + 'static> Session<S> {
         }
 
         // Register fact mapping
-        self.fact_to_tuple_map.borrow_mut().insert(fact_id, tuple_index);
+        self.fact_to_tuple_map
+            .borrow_mut()
+            .insert(fact_id, tuple_index);
 
         // Schedule insertion
-        self.scheduler.borrow_mut().schedule_insert(tuple_index, &mut self.tuples.borrow_mut())?;
+        self.scheduler
+            .borrow_mut()
+            .schedule_insert(tuple_index, &mut self.tuples.borrow_mut())?;
 
         Ok(())
     }
@@ -98,10 +86,44 @@ impl<S: Score + 'static> Session<S> {
     pub fn retract<T: GreynetFact>(&mut self, fact: &T) -> Result<(), String> {
         let fact_id = fact.fact_id();
 
-        let tuple_index = self.fact_to_tuple_map.borrow_mut().remove(&fact_id)
+        // FIXED: Don't remove from map until we're sure scheduling succeeds
+        let tuple_index = self
+            .fact_to_tuple_map
+            .borrow()
+            .get(&fact_id)
+            .copied()
             .ok_or_else(|| format!("Fact with ID {} not found.", fact_id))?;
 
-        self.scheduler.borrow_mut().schedule_retract(tuple_index, &mut self.tuples.borrow_mut())?;
+        // Try to schedule retraction first
+        self.scheduler
+            .borrow_mut()
+            .schedule_retract(tuple_index, &mut self.tuples.borrow_mut())?;
+
+        // FIXED: Only remove from map if scheduling succeeded
+        self.fact_to_tuple_map.borrow_mut().remove(&fact_id);
+
+        Ok(())
+    }
+
+    // FIXED: Better clear method with proper cleanup
+    pub fn clear(&mut self) -> Result<(), String> {
+        // Collect all tuple indices before clearing the map
+        let tuple_indices_to_retract: Vec<SafeTupleIndex> =
+            self.fact_to_tuple_map.borrow().values().cloned().collect();
+
+        // Clear the map first to prevent new operations
+        self.fact_to_tuple_map.borrow_mut().clear();
+
+        // Schedule all retractions
+        for index in tuple_indices_to_retract {
+            // This schedules the tuple to be marked as Dying and processed by the scheduler
+            self.scheduler
+                .borrow_mut()
+                .schedule_retract(index, &mut self.tuples.borrow_mut())?;
+        }
+
+        // Process all the pending retractions
+        self.flush()?;
 
         Ok(())
     }
@@ -129,7 +151,9 @@ impl<S: Score + 'static> Session<S> {
     }
 
     pub fn update_constraint_weight(&self, constraint_id: &str, new_weight: f64) {
-        self.weights.borrow().set_weight(constraint_id.to_string(), new_weight);
+        self.weights
+            .borrow_mut()
+            .set_weight(constraint_id.to_string(), new_weight);
 
         let mut nodes = self.nodes.borrow_mut();
         let tuples = self.tuples.borrow();
@@ -167,39 +191,46 @@ impl<S: Score + 'static> Session<S> {
         Ok(all_matches)
     }
 
-    pub fn insert_batch<T: GreynetFact + 'static>(&mut self, facts: impl IntoIterator<Item = T>) -> Result<(), String> {
+    pub fn insert_batch<T: GreynetFact + 'static>(
+        &mut self,
+        facts: impl IntoIterator<Item = T>,
+    ) -> Result<(), String> {
         for fact in facts {
-            let fact_id = fact.fact_id();
-            let fact_type_id = TypeId::of::<T>();
-    
-            if self.fact_to_tuple_map.borrow().contains_key(&fact_id) {
-                continue; // Or return an error, depending on desired behavior
-            }
-    
-            let from_node_id = *self.from_nodes.get(&fact_type_id)
-                .ok_or_else(|| format!("No 'from' node registered for type {:?}", fact_type_id))?;
-    
-            let tuple = AnyTuple::Uni(UniTuple::new(Rc::new(fact)));
-            let tuple_index = self.tuples.borrow_mut().acquire_tuple(tuple);
-    
-            if let Some(t) = self.tuples.borrow_mut().get_tuple_mut(tuple_index) {
-                t.set_node(from_node_id);
-            }
-    
-            self.fact_to_tuple_map.borrow_mut().insert(fact_id, tuple_index);
-            self.scheduler.borrow_mut().schedule_insert(tuple_index, &mut self.tuples.borrow_mut())?;
+            self.insert(fact)?;
         }
         Ok(())
     }
-    
-    pub fn retract_batch<T: GreynetFact + 'static>(&mut self, facts: impl IntoIterator<Item = &'static T>) -> Result<(), String> {
+
+    pub fn retract_batch<'a, T: GreynetFact + 'a>(
+        &mut self,
+        facts: impl IntoIterator<Item = &'a T>,
+    ) -> Result<(), String> {
         for fact in facts {
-            let fact_id = fact.fact_id();
-    
-            if let Some(tuple_index) = self.fact_to_tuple_map.borrow_mut().remove(&fact_id) {
-                self.scheduler.borrow_mut().schedule_retract(tuple_index, &mut self.tuples.borrow_mut())?;
+            self.retract(fact)?;
+        }
+        Ok(())
+    }
+
+    // FIXED: Add method to check for inconsistencies
+    pub fn validate_consistency(&self) -> Result<(), String> {
+        let map_count = self.fact_to_tuple_map.borrow().len();
+        let mut arena_live_count = 0;
+
+        // Count live tuples in arena
+        let tuples = self.tuples.borrow();
+        for (_, tuple) in tuples.arena.iter() {
+            if !matches!(tuple.state(), TupleState::Dead) {
+                arena_live_count += 1;
             }
         }
+
+        if map_count != arena_live_count {
+            return Err(format!(
+                "Consistency violation: {} facts in map, {} live tuples in arena",
+                map_count, arena_live_count
+            ));
+        }
+
         Ok(())
     }
 }
