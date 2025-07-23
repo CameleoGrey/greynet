@@ -7,7 +7,7 @@ repository = "https://github.com/CameleoGrey/greynet/"
 documentation = "https://github.com/CameleoGrey/greynet/docs"
 description = "High performance rule and constraint satisfaction engine"
 license = "Apache-2.0"
-keywords = ["greynet", "rule-engine", "rule", "rules", "engine", "greyjack", "solver"]
+keywords = ["greynet", "rule-engine", "engine", "greyjack", "solver"]
 categories = [
     "mathematics",
 	"science",
@@ -17,6 +17,6 @@ categories = [
 ]
 
 [dependencies]
-uuid = "1.17.0"
+uuid = { version = "1.17.0", features = ["v3", "v4", "v5"] }
 slotmap = "1.0.7"
 generational-arena = "0.2.9"
