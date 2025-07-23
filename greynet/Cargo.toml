@@ -1,0 +1,22 @@
+[package]
+name = "greynet"
+edition = "2021"
+version = "0.5.0"
+authors = ["CameleoGrey (Egor Chnegov) <cameleogrey@yandex.ru>"]
+repository = "https://github.com/CameleoGrey/greynet/"
+documentation = "https://github.com/CameleoGrey/greynet/docs"
+description = "High performance rule and constraint satisfaction engine"
+license = "Apache-2.0"
+keywords = ["greynet", "rule-engine", "rule", "rules", "engine", "greyjack", "solver"]
+categories = [
+    "mathematics",
+	"science",
+    "algorithms",
+    "data-structures",
+	"web-programming"
+]
+
+[dependencies]
+uuid = "1.17.0"
+slotmap = "1.0.7"
+generational-arena = "0.2.9"
