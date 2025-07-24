@@ -9,38 +9,79 @@ use uuid::Uuid;
 use std::hash::Hasher;
 use std::hash::DefaultHasher;
 use std::any::Any;
+use rustc_hash::FxHashMap as HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-/// A trait for objects that can aggregate data within a `group_by` operation.
-pub trait BaseCollector {
-    /// Inserts an item and returns an undo function.
+pub trait BaseCollector: std::fmt::Debug {
     fn insert(&mut self, item: &AnyTuple) -> UndoFunction;
-    /// Returns the current result of the aggregation as a `GreynetFact`.
     fn result_as_fact(&self) -> Rc<dyn GreynetFact>;
-    /// Checks if the collector is empty.
     fn is_empty(&self) -> bool;
 }
 
-/// Safe undo function that captures state
+/// High-performance enum dispatch for common collectors
+#[derive(Debug)]
+pub enum FastCollector {
+    Count(CountCollector),
+    Sum(SumCollector<fn(&AnyTuple) -> f64>),
+    List(ListCollector),
+    Custom(Box<dyn BaseCollector>),
+}
+
+impl BaseCollector for FastCollector {
+    #[inline]
+    fn insert(&mut self, item: &AnyTuple) -> UndoFunction {
+        match self {
+            FastCollector::Count(c) => c.insert(item),
+            FastCollector::Sum(c) => c.insert(item),
+            FastCollector::List(c) => c.insert(item),
+            FastCollector::Custom(c) => c.insert(item),
+        }
+    }
+    
+    #[inline]
+    fn result_as_fact(&self) -> Rc<dyn GreynetFact> {
+        match self {
+            FastCollector::Count(c) => c.result_as_fact(),
+            FastCollector::Sum(c) => c.result_as_fact(),
+            FastCollector::List(c) => c.result_as_fact(),
+            FastCollector::Custom(c) => c.result_as_fact(),
+        }
+    }
+    
+    #[inline]
+    fn is_empty(&self) -> bool {
+        match self {
+            FastCollector::Count(c) => c.is_empty(),
+            FastCollector::Sum(c) => c.is_empty(),
+            FastCollector::List(c) => c.is_empty(),
+            FastCollector::Custom(c) => c.is_empty(),
+        }
+    }
+}
+
 pub struct UndoFunction {
     undo_fn: Box<dyn FnOnce()>,
 }
 
 impl UndoFunction {
+    #[inline]
     pub fn new<F: FnOnce() + 'static>(f: F) -> Self {
         Self { undo_fn: Box::new(f) }
     }
 
+    #[inline]
     pub fn execute(self) {
         (self.undo_fn)();
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct CountCollector {
     count: Rc<RefCell<usize>>,
 }
 
 impl BaseCollector for CountCollector {
+    #[inline]
     fn insert(&mut self, _item: &AnyTuple) -> UndoFunction {
         *self.count.borrow_mut() += 1;
         let count = self.count.clone();
@@ -49,10 +90,12 @@ impl BaseCollector for CountCollector {
         })
     }
 
+    #[inline]
     fn result_as_fact(&self) -> Rc<dyn GreynetFact> {
         Rc::new(*self.count.borrow())
     }
 
+    #[inline]
     fn is_empty(&self) -> bool {
         *self.count.borrow() == 0
     }
@@ -67,10 +110,24 @@ where
     count: Rc<RefCell<usize>>,
 }
 
+impl<F> std::fmt::Debug for SumCollector<F>
+where
+    F: Fn(&AnyTuple) -> f64 + 'static,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SumCollector")
+            .field("mapping_function", &"<closure>")
+            .field("total", &self.total)
+            .field("count", &self.count)
+            .finish()
+    }
+}
+
 impl<F> BaseCollector for SumCollector<F>
 where
     F: Fn(&AnyTuple) -> f64 + 'static,
 {
+    #[inline]
     fn insert(&mut self, item: &AnyTuple) -> UndoFunction {
         let value = (self.mapping_function)(item);
         *self.total.borrow_mut() += value;
@@ -83,10 +140,12 @@ where
         })
     }
 
+    #[inline]
     fn result_as_fact(&self) -> Rc<dyn GreynetFact> {
         Rc::new(*self.total.borrow())
     }
 
+    #[inline]
     fn is_empty(&self) -> bool {
         *self.count.borrow() == 0
     }
@@ -99,6 +158,19 @@ where
     mapping_function: F,
     total: Rc<RefCell<f64>>,
     count: Rc<RefCell<usize>>,
+}
+
+impl<F> std::fmt::Debug for AvgCollector<F>
+where
+    F: Fn(&AnyTuple) -> f64 + 'static,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AvgCollector")
+            .field("mapping_function", &"<closure>")
+            .field("total", &self.total)
+            .field("count", &self.count)
+            .finish()
+    }
 }
 
 impl<F> BaseCollector for AvgCollector<F>
@@ -132,31 +204,41 @@ where
     }
 }
 
-#[derive(Default)]
+// IMPROVED: ListCollector with O(1) undo operations using unique IDs
+static NEXT_ITEM_ID: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Default, Debug)]
 pub struct ListCollector {
-    items: Rc<RefCell<Vec<AnyTuple>>>,
+    items: Rc<RefCell<HashMap<u64, AnyTuple>>>, // Store with unique IDs for fast removal
+    insertion_order: Rc<RefCell<Vec<u64>>>, // Maintain insertion order
 }
 
 impl BaseCollector for ListCollector {
     fn insert(&mut self, item: &AnyTuple) -> UndoFunction {
+        let item_id = NEXT_ITEM_ID.fetch_add(1, Ordering::Relaxed);
         let owned_item = item.clone();
-        self.items.borrow_mut().push(owned_item.clone());
+        
+        self.items.borrow_mut().insert(item_id, owned_item);
+        self.insertion_order.borrow_mut().push(item_id);
+        
         let items = self.items.clone();
+        let insertion_order = self.insertion_order.clone();
+        
         UndoFunction::new(move || {
-            let mut items_borrowed = items.borrow_mut();
-            if let Some(pos) = items_borrowed.iter().position(|x| {
-                if x.arity() != owned_item.arity() { return false; }
-                let x_facts = x.facts();
-                let item_facts = owned_item.facts();
-                x_facts.iter().zip(item_facts.iter()).all(|(a, b)| a.eq_fact(&**b))
-            }) {
-                items_borrowed.remove(pos);
-            }
+            items.borrow_mut().remove(&item_id);
+            insertion_order.borrow_mut().retain(|&id| id != item_id);
         })
     }
 
     fn result_as_fact(&self) -> Rc<dyn GreynetFact> {
-        Rc::new(self.items.borrow().clone())
+        let items = self.items.borrow();
+        let order = self.insertion_order.borrow();
+        
+        let tuples: Vec<AnyTuple> = order.iter()
+            .filter_map(|&id| items.get(&id).cloned())
+            .collect();
+        
+        Rc::new(tuples)
     }
 
     fn is_empty(&self) -> bool {
@@ -171,6 +253,19 @@ where
 {
     mapping_function: F,
     counts: Rc<RefCell<BTreeMap<K, usize>>>,
+}
+
+impl<K, F> std::fmt::Debug for MinCollector<K, F>
+where
+    K: Ord + Clone + GreynetFact + std::fmt::Debug,
+    F: Fn(&AnyTuple) -> K + 'static,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MinCollector")
+            .field("mapping_function", &"<closure>")
+            .field("counts", &self.counts)
+            .finish()
+    }
 }
 
 impl<K, F> BaseCollector for MinCollector<K, F>
@@ -216,6 +311,19 @@ where
     counts: Rc<RefCell<BTreeMap<K, usize>>>,
 }
 
+impl<K, F> std::fmt::Debug for MaxCollector<K, F>
+where
+    K: Ord + Clone + GreynetFact + std::fmt::Debug,
+    F: Fn(&AnyTuple) -> K + 'static,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MaxCollector")
+            .field("mapping_function", &"<closure>")
+            .field("counts", &self.counts)
+            .finish()
+    }
+}
+
 impl<K, F> BaseCollector for MaxCollector<K, F>
 where
     K: Ord + Clone + GreynetFact,
@@ -250,71 +358,41 @@ where
     }
 }
 
-// FilteringCollector: Filters items based on a predicate before passing them to a downstream collector
-pub struct FilteringCollector<P>
-where
-    P: Fn(&AnyTuple) -> bool + 'static,
-{
-    predicate: P,
-    downstream: Box<dyn BaseCollector>,
-    count: Rc<RefCell<usize>>,
-}
-
-impl<P> BaseCollector for FilteringCollector<P>
-where
-    P: Fn(&AnyTuple) -> bool + 'static,
-{
-    fn insert(&mut self, item: &AnyTuple) -> UndoFunction {
-        *self.count.borrow_mut() += 1;
-        let count = self.count.clone();
-        
-        if (self.predicate)(item) {
-            let downstream_undo = self.downstream.insert(item);
-            UndoFunction::new(move || {
-                downstream_undo.execute();
-                *count.borrow_mut() -= 1;
-            })
-        } else {
-            UndoFunction::new(move || {
-                *count.borrow_mut() -= 1;
-            })
-        }
-    }
-
-    fn result_as_fact(&self) -> Rc<dyn GreynetFact> {
-        self.downstream.result_as_fact()
-    }
-
-    fn is_empty(&self) -> bool {
-        *self.count.borrow() == 0
-    }
-}
-
-// SetCollector: Aggregates items into a standard set
 #[derive(Default)]
 pub struct SetCollector {
-    items: Rc<RefCell<HashSet<String>>>, // Using String hash for simplicity
-    tuple_hashes: Rc<RefCell<Vec<String>>>, // Track insertion order for undo
+    items: Rc<RefCell<HashSet<String>>>,
+    tuple_hashes: Rc<RefCell<HashMap<String, usize>>>, // Count occurrences for proper undo
+}
+
+impl std::fmt::Debug for SetCollector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SetCollector")
+            .field("items", &self.items)
+            .field("tuple_hashes", &self.tuple_hashes)
+            .finish()
+    }
 }
 
 impl BaseCollector for SetCollector {
     fn insert(&mut self, item: &AnyTuple) -> UndoFunction {
-        // Create a deterministic hash for the tuple
         let item_hash = Self::hash_tuple(item);
-        self.items.borrow_mut().insert(item_hash.clone());
-        self.tuple_hashes.borrow_mut().push(item_hash.clone());
         
-        let items = self.items.clone();
-        let tuple_hashes = self.tuple_hashes.clone();
+        let mut items = self.items.borrow_mut();
+        let mut hashes = self.tuple_hashes.borrow_mut();
+        
+        items.insert(item_hash.clone());
+        *hashes.entry(item_hash.clone()).or_insert(0) += 1;
+        
+        let items_ref = self.items.clone();
+        let hashes_ref = self.tuple_hashes.clone();
         
         UndoFunction::new(move || {
-            let mut hashes = tuple_hashes.borrow_mut();
-            if let Some(pos) = hashes.iter().rposition(|h| h == &item_hash) {
-                hashes.remove(pos);
-                
-                // Only remove from set if this was the last occurrence
-                if !hashes.contains(&item_hash) {
-                    items.borrow_mut().remove(&item_hash);
+            let mut hashes_borrowed = hashes_ref.borrow_mut();
+            if let Some(count) = hashes_borrowed.get_mut(&item_hash) {
+                *count -= 1;
+                if *count == 0 {
+                    hashes_borrowed.remove(&item_hash);
+                    items_ref.borrow_mut().remove(&item_hash);
                 }
             }
         })
@@ -332,7 +410,7 @@ impl BaseCollector for SetCollector {
 
 impl SetCollector {
     fn hash_tuple(tuple: &AnyTuple) -> String {
-        let facts = tuple.facts();
+        let facts = tuple.facts_vec();
         let mut hash_parts = Vec::new();
         for fact in facts {
             hash_parts.push(fact.hash_fact().to_string());
@@ -341,32 +419,42 @@ impl SetCollector {
     }
 }
 
-// DistinctCollector: Aggregates unique items into a vec, preserving insertion order
 #[derive(Default)]
 pub struct DistinctCollector {
-    items: Rc<RefCell<Vec<AnyTuple>>>,
-    seen: Rc<RefCell<HashSet<String>>>,
-    counts: Rc<RefCell<std::collections::HashMap<String, usize>>>,
+    items: Rc<RefCell<HashMap<String, AnyTuple>>>, // Use hash as key for uniqueness
+    insertion_order: Rc<RefCell<Vec<String>>>, // Maintain insertion order
+    counts: Rc<RefCell<HashMap<String, usize>>>, // Count for proper undo
+}
+
+impl std::fmt::Debug for DistinctCollector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DistinctCollector")
+            .field("items", &self.items)
+            .field("insertion_order", &self.insertion_order)
+            .field("counts", &self.counts)
+            .finish()
+    }
 }
 
 impl BaseCollector for DistinctCollector {
     fn insert(&mut self, item: &AnyTuple) -> UndoFunction {
         let item_hash = SetCollector::hash_tuple(item);
-        let mut seen = self.seen.borrow_mut();
-        let mut counts = self.counts.borrow_mut();
-        let mut items = self.items.borrow_mut();
         
-        let is_new = !seen.contains(&item_hash);
+        let mut items = self.items.borrow_mut();
+        let mut order = self.insertion_order.borrow_mut();
+        let mut counts = self.counts.borrow_mut();
+        
+        let is_new = !items.contains_key(&item_hash);
         if is_new {
-            seen.insert(item_hash.clone());
-            items.push(item.clone());
+            items.insert(item_hash.clone(), item.clone());
+            order.push(item_hash.clone());
         }
         
         *counts.entry(item_hash.clone()).or_insert(0) += 1;
         
-        let seen_ref = self.seen.clone();
-        let counts_ref = self.counts.clone();
         let items_ref = self.items.clone();
+        let order_ref = self.insertion_order.clone();
+        let counts_ref = self.counts.clone();
         
         UndoFunction::new(move || {
             let mut counts_borrowed = counts_ref.borrow_mut();
@@ -374,22 +462,22 @@ impl BaseCollector for DistinctCollector {
                 *count -= 1;
                 if *count == 0 {
                     counts_borrowed.remove(&item_hash);
-                    seen_ref.borrow_mut().remove(&item_hash);
-                    
-                    // Remove from items vec
-                    let mut items_borrowed = items_ref.borrow_mut();
-                    if let Some(pos) = items_borrowed.iter().position(|t| {
-                        SetCollector::hash_tuple(t) == item_hash
-                    }) {
-                        items_borrowed.remove(pos);
-                    }
+                    items_ref.borrow_mut().remove(&item_hash);
+                    order_ref.borrow_mut().retain(|h| h != &item_hash);
                 }
             }
         })
     }
 
     fn result_as_fact(&self) -> Rc<dyn GreynetFact> {
-        Rc::new(self.items.borrow().clone())
+        let items = self.items.borrow();
+        let order = self.insertion_order.borrow();
+        
+        let tuples: Vec<AnyTuple> = order.iter()
+            .filter_map(|hash| items.get(hash).cloned())
+            .collect();
+        
+        Rc::new(tuples)
     }
 
     fn is_empty(&self) -> bool {
@@ -397,250 +485,7 @@ impl BaseCollector for DistinctCollector {
     }
 }
 
-// CompositeCollector: Allows multiple aggregations to be performed on the same group simultaneously
-pub struct CompositeCollector {
-    collectors: Vec<Box<dyn BaseCollector>>,
-    results: Rc<RefCell<Vec<Rc<dyn GreynetFact>>>>,
-}
-
-impl CompositeCollector {
-    pub fn new(collectors: Vec<Box<dyn BaseCollector>>) -> Self {
-        Self {
-            collectors,
-            results: Rc::new(RefCell::new(Vec::new())),
-        }
-    }
-}
-
-impl BaseCollector for CompositeCollector {
-    fn insert(&mut self, item: &AnyTuple) -> UndoFunction {
-        let mut undo_functions = Vec::new();
-        
-        for collector in &mut self.collectors {
-            undo_functions.push(collector.insert(item));
-        }
-        
-        UndoFunction::new(move || {
-            for undo_fn in undo_functions {
-                undo_fn.execute();
-            }
-        })
-    }
-
-    fn result_as_fact(&self) -> Rc<dyn GreynetFact> {
-        let results: Vec<Rc<dyn GreynetFact>> = self.collectors
-            .iter()
-            .map(|c| c.result_as_fact())
-            .collect();
-        Rc::new(results)
-    }
-
-    fn is_empty(&self) -> bool {
-        self.collectors.iter().all(|c| c.is_empty())
-    }
-}
-
-// MappingCollector: Applies a mapping function to each item before passing it to a downstream collector
-pub struct MappingCollector<F>
-where
-    F: Fn(&AnyTuple) -> AnyTuple + 'static,
-{
-    mapper: F,
-    downstream: Box<dyn BaseCollector>,
-    count: Rc<RefCell<usize>>,
-}
-
-impl<F> BaseCollector for MappingCollector<F>
-where
-    F: Fn(&AnyTuple) -> AnyTuple + 'static,
-{
-    fn insert(&mut self, item: &AnyTuple) -> UndoFunction {
-        let mapped_item = (self.mapper)(item);
-        *self.count.borrow_mut() += 1;
-        let count = self.count.clone();
-        
-        let downstream_undo = self.downstream.insert(&mapped_item);
-        
-        UndoFunction::new(move || {
-            downstream_undo.execute();
-            *count.borrow_mut() -= 1;
-        })
-    }
-
-    fn result_as_fact(&self) -> Rc<dyn GreynetFact> {
-        self.downstream.result_as_fact()
-    }
-
-    fn is_empty(&self) -> bool {
-        *self.count.borrow() == 0
-    }
-}
-
-// StdDevCollector: Calculates the standard deviation of a group
-pub struct StdDevCollector<F>
-where
-    F: Fn(&AnyTuple) -> f64 + 'static,
-{
-    mapping_function: F,
-    sum: Rc<RefCell<f64>>,
-    sum_of_squares: Rc<RefCell<f64>>,
-    count: Rc<RefCell<usize>>,
-}
-
-impl<F> BaseCollector for StdDevCollector<F>
-where
-    F: Fn(&AnyTuple) -> f64 + 'static,
-{
-    fn insert(&mut self, item: &AnyTuple) -> UndoFunction {
-        let value = (self.mapping_function)(item);
-        let value_squared = value * value;
-        
-        *self.sum.borrow_mut() += value;
-        *self.sum_of_squares.borrow_mut() += value_squared;
-        *self.count.borrow_mut() += 1;
-        
-        let sum = self.sum.clone();
-        let sum_of_squares = self.sum_of_squares.clone();
-        let count = self.count.clone();
-        
-        UndoFunction::new(move || {
-            *sum.borrow_mut() -= value;
-            *sum_of_squares.borrow_mut() -= value_squared;
-            *count.borrow_mut() -= 1;
-        })
-    }
-
-    fn result_as_fact(&self) -> Rc<dyn GreynetFact> {
-        let count = *self.count.borrow();
-        if count == 0 {
-            return Rc::new(0.0);
-        }
-        
-        let sum = *self.sum.borrow();
-        let sum_of_squares = *self.sum_of_squares.borrow();
-        let n = count as f64;
-        
-        let mean = sum / n;
-        let variance = (sum_of_squares / n) - (mean * mean);
-        let std_dev = variance.sqrt();
-        
-        Rc::new(std_dev)
-    }
-
-    fn is_empty(&self) -> bool {
-        *self.count.borrow() == 0
-    }
-}
-
-// Add these factory methods to the Collectors impl block:
-impl Collectors {
-    pub fn filtering<P>(
-        predicate: P,
-        downstream_supplier: Box<dyn Fn() -> Box<dyn BaseCollector>>,
-    ) -> Box<dyn Fn() -> Box<dyn BaseCollector>>
-    where
-        P: Fn(&AnyTuple) -> bool + Clone + 'static,
-    {
-        Box::new(move || {
-            Box::new(FilteringCollector {
-                predicate: predicate.clone(),
-                downstream: downstream_supplier(),
-                count: Rc::new(RefCell::new(0)),
-            })
-        })
-    }
-
-    pub fn to_set() -> Box<dyn Fn() -> Box<dyn BaseCollector>> {
-        Box::new(|| Box::new(SetCollector::default()))
-    }
-
-    pub fn distinct() -> Box<dyn Fn() -> Box<dyn BaseCollector>> {
-        Box::new(|| Box::new(DistinctCollector::default()))
-    }
-
-    pub fn composite(
-        suppliers: Vec<Box<dyn Fn() -> Box<dyn BaseCollector>>>,
-    ) -> Box<dyn Fn() -> Box<dyn BaseCollector>> {
-        Box::new(move || {
-            let collectors: Vec<Box<dyn BaseCollector>> = suppliers
-                .iter()
-                .map(|supplier| supplier())
-                .collect();
-            Box::new(CompositeCollector::new(collectors))
-        })
-    }
-
-    pub fn mapping<F>(
-        mapper: F,
-        downstream_supplier: Box<dyn Fn() -> Box<dyn BaseCollector>>,
-    ) -> Box<dyn Fn() -> Box<dyn BaseCollector>>
-    where
-        F: Fn(&AnyTuple) -> AnyTuple + Clone + 'static,
-    {
-        Box::new(move || {
-            Box::new(MappingCollector {
-                mapper: mapper.clone(),
-                downstream: downstream_supplier(),
-                count: Rc::new(RefCell::new(0)),
-            })
-        })
-    }
-
-    pub fn std_dev<F>(mapping_function: F) -> Box<dyn Fn() -> Box<dyn BaseCollector>>
-    where
-        F: Fn(&AnyTuple) -> f64 + Clone + 'static,
-    {
-        Box::new(move || {
-            Box::new(StdDevCollector {
-                mapping_function: mapping_function.clone(),
-                sum: Rc::new(RefCell::new(0.0)),
-                sum_of_squares: Rc::new(RefCell::new(0.0)),
-                count: Rc::new(RefCell::new(0)),
-            })
-        })
-    }
-}
-
-// Add GreynetFact implementation for Vec<Rc<dyn GreynetFact>> (needed for CompositeCollector)
-impl GreynetFact for Vec<Rc<dyn GreynetFact>> {
-    fn fact_id(&self) -> Uuid {
-        let namespace = Uuid::parse_str("d9e2f3a4-c5b6-a7d8-e9f0-a1b2c3d4e5f6").unwrap();
-        let mut hasher = DefaultHasher::new();
-        for fact in self {
-            fact.hash_fact().hash(&mut hasher);
-        }
-        Uuid::new_v5(&namespace, &hasher.finish().to_be_bytes())
-    }
-
-    fn clone_fact(&self) -> Box<dyn GreynetFact> {
-        Box::new(self.clone())
-    }
-
-    fn eq_fact(&self, other: &dyn GreynetFact) -> bool {
-        if let Some(other_vec) = other.as_any().downcast_ref::<Vec<Rc<dyn GreynetFact>>>() {
-            if self.len() != other_vec.len() {
-                return false;
-            }
-            self.iter().zip(other_vec.iter()).all(|(f1, f2)| f1.eq_fact(&**f2))
-        } else {
-            false
-        }
-    }
-
-    fn hash_fact(&self) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        for fact in self {
-            fact.hash_fact().hash(&mut hasher);
-        }
-        hasher.finish()
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-/// A factory for creating collector suppliers.
+/// Factory for creating collectors
 pub struct Collectors;
 
 impl Collectors {
@@ -702,5 +547,13 @@ impl Collectors {
                 counts: Rc::new(RefCell::new(BTreeMap::new())),
             })
         })
+    }
+
+    pub fn to_set() -> Box<dyn Fn() -> Box<dyn BaseCollector>> {
+        Box::new(|| Box::new(SetCollector::default()))
+    }
+
+    pub fn distinct() -> Box<dyn Fn() -> Box<dyn BaseCollector>> {
+        Box::new(|| Box::new(DistinctCollector::default()))
     }
 }

@@ -1,7 +1,7 @@
 //constraint_builder.rs
 use crate::factory::ConstraintFactory;
 use crate::stream_def::{Stream, Arity1, ConstraintRecipe};
-use crate::{GreynetFact, Score, constraint::ConstraintWeights};
+use crate::{GreynetFact, Score, constraint::ConstraintWeights, Result, ResourceLimits};
 use crate::session::Session;
 use std::rc::Rc;
 use std::cell::RefCell;
@@ -10,6 +10,7 @@ use crate::stream_def::Arity2;
 use crate::JoinerType;
 use crate::AnyTuple;
 
+/// High-level builder for constraint satisfaction problems with comprehensive error handling
 #[derive(Debug)]
 pub struct ConstraintBuilder<S: Score> {
     factory: Rc<RefCell<ConstraintFactory<S>>>,
@@ -19,8 +20,12 @@ pub struct ConstraintBuilder<S: Score> {
 
 impl<S: Score + 'static> ConstraintBuilder<S> {
     pub fn new() -> Self {
+        Self::with_limits(ResourceLimits::default())
+    }
+    
+    pub fn with_limits(limits: ResourceLimits) -> Self {
         let weights = Rc::new(RefCell::new(ConstraintWeights::new()));
-        let factory = Rc::new(RefCell::new(ConstraintFactory::new(Rc::clone(&weights))));
+        let factory = Rc::new(RefCell::new(ConstraintFactory::with_limits(Rc::clone(&weights), limits)));
         Self {
             factory,
             weights,
@@ -28,6 +33,7 @@ impl<S: Score + 'static> ConstraintBuilder<S> {
         }
     }
 
+    #[inline]
     pub fn for_each<T: GreynetFact + 'static>(&self) -> Stream<Arity1, S> {
         ConstraintFactory::from::<T>(&self.factory)
     }
@@ -38,9 +44,8 @@ impl<S: Score + 'static> ConstraintBuilder<S> {
         
         stream1.join(
             stream2,
-            JoinerType::LessThan, // Ensures (a,b) is processed but not (b,a)
+            JoinerType::LessThan,
             Rc::new(|tuple: &AnyTuple| {
-                // Use the fact's unique hash for comparison
                 if let AnyTuple::Uni(uni_tuple) = tuple {
                     uni_tuple.fact_a.hash_fact()
                 } else {
@@ -57,6 +62,7 @@ impl<S: Score + 'static> ConstraintBuilder<S> {
         )
     }
 
+    #[inline]
     pub fn constraint(&self, id: &str, weight: f64, recipe_fn: impl Fn() -> ConstraintRecipe<S>) -> &Self {
         self.weights.borrow().set_weight(id.to_string(), weight);
         let recipe = recipe_fn();
@@ -64,9 +70,9 @@ impl<S: Score + 'static> ConstraintBuilder<S> {
         self
     }
 
-    pub fn build(self) -> Session<S> {
+    pub fn build(self) -> Result<Session<S>> {
         let factory = Rc::try_unwrap(self.factory)
-            .expect("ConstraintFactory has multiple owners")
+            .map_err(|_| crate::GreynetError::constraint_builder_error("ConstraintFactory has multiple owners"))?
             .into_inner();
         factory.build_session()
     }

@@ -82,7 +82,7 @@ dependencies = [
 
 [[package]]
 name = "greynet"
-version = "0.5.2"
+version = "0.5.1"
 dependencies = [
  "generational-arena",
  "slotmap",

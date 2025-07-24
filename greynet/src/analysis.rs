@@ -1,15 +1,16 @@
 //analysis.rs
 use crate::session::Session;
 use crate::arena::NodeData;
-use crate::{Score, AnyTuple};
-use std::collections::HashMap;
+use crate::{Score, AnyTuple, GreynetError};
+use crate::error::Result;
+use rustc_hash::FxHashMap as HashMap;
 
 /// Analysis tools for constraint sessions
 pub struct ConstraintAnalysis;
 
 impl ConstraintAnalysis {
     /// Get detailed constraint violation analysis
-    pub fn analyze_violations<S: Score>(session: &mut Session<S>) -> Result<ConstraintViolationReport<S>, String> {
+    pub fn analyze_violations<S: Score>(session: &mut Session<S>) -> Result<ConstraintViolationReport<S>> {
         let constraint_matches = session.get_constraint_matches()?;
         let total_score = session.get_score()?;
         let feasible = Self::is_feasible(&total_score);
@@ -42,19 +43,16 @@ impl ConstraintAnalysis {
 
     /// Get network statistics
     pub fn get_network_stats<S: Score>(session: &Session<S>) -> NetworkStatistics {
-        let nodes = session.nodes.borrow();
-        let tuples = session.tuples.borrow();
-
         let mut stats = NetworkStatistics {
-            total_nodes: nodes.len(),
-            total_tuples: tuples.arena.len(),
+            total_nodes: session.nodes.len(),
+            total_tuples: session.tuples.arena.len(),
             active_tuples: 0,
-            node_type_counts: HashMap::new(),
+            node_type_counts: HashMap::default(),
             memory_usage_estimate: 0,
         };
 
         // Count node types
-        for (_, node_data) in nodes.nodes.iter() {
+        for (_, node_data) in session.nodes.nodes.iter() {
             let node_type = match node_data {
                 NodeData::From(_) => "From",
                 NodeData::Filter(_) => "Filter",
@@ -70,7 +68,7 @@ impl ConstraintAnalysis {
         }
 
         // Estimate memory usage (rough approximation)
-        stats.memory_usage_estimate = stats.total_nodes * 1000 + stats.total_tuples * 200;
+        stats.memory_usage_estimate = session.tuples.memory_usage_estimate();
 
         stats
     }

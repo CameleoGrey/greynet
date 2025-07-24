@@ -1,13 +1,13 @@
 //node_operations.rs
 use super::arena::{NodeArena, NodeData, NodeId, NodeOperation, SafeTupleIndex, TupleArena};
 use crate::AnyTuple;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 pub struct NodeOperations;
 
 impl NodeOperations {
     pub fn get_operation_stats<S: crate::Score>(nodes: &NodeArena<S>) -> HashMap<String, usize> {
-        let mut stats = HashMap::new();
+        let mut stats = HashMap::default();
         let mut join_count = 0;
         let mut conditional_count = 0;
         let mut filter_count = 0;

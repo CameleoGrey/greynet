@@ -2,37 +2,92 @@
 use crate::arena::{NodeArena, SafeTupleIndex, TupleArena, NodeOperation};
 use crate::state::TupleState;
 use crate::score::Score;
+use crate::{Result, GreynetError, ResourceLimits};
 use std::collections::VecDeque;
 
+/// Object pool for reducing allocations
+#[derive(Debug)]
+pub struct OperationPool {
+    operation_buffers: Vec<Vec<NodeOperation>>,
+    index_buffers: Vec<Vec<SafeTupleIndex>>,
+}
+
+impl OperationPool {
+    pub fn new() -> Self {
+        Self {
+            operation_buffers: Vec::new(),
+            index_buffers: Vec::new(),
+        }
+    }
+
+    #[inline]
+    pub fn get_operation_buffer(&mut self) -> Vec<NodeOperation> {
+        self.operation_buffers.pop().unwrap_or_else(|| Vec::with_capacity(128))
+    }
+    
+    #[inline]
+    pub fn return_operation_buffer(&mut self, mut buffer: Vec<NodeOperation>) {
+        buffer.clear();
+        if buffer.capacity() <= 512 {
+            self.operation_buffers.push(buffer);
+        }
+    }
+
+    #[inline]
+    pub fn get_index_buffer(&mut self) -> Vec<SafeTupleIndex> {
+        self.index_buffers.pop().unwrap_or_else(|| Vec::with_capacity(64))
+    }
+    
+    #[inline]
+    pub fn return_index_buffer(&mut self, mut buffer: Vec<SafeTupleIndex>) {
+        buffer.clear();
+        if buffer.capacity() <= 256 {
+            self.index_buffers.push(buffer);
+        }
+    }
+}
+
+/// High-performance batch scheduler with object pooling and safety guarantees
+#[derive(Debug)]
 pub struct BatchScheduler {
     pending_queue: VecDeque<SafeTupleIndex>,
     operation_queue: VecDeque<NodeOperation>,
+    pool: OperationPool,
+    limits: ResourceLimits,
 }
 
 impl BatchScheduler {
     pub fn new() -> Self {
+        Self::with_limits(ResourceLimits::default())
+    }
+    
+    pub fn with_limits(limits: ResourceLimits) -> Self {
         Self {
             pending_queue: VecDeque::new(),
             operation_queue: VecDeque::new(),
+            pool: OperationPool::new(),
+            limits,
         }
     }
 
-    pub fn schedule_insert(&mut self, tuple_index: SafeTupleIndex, tuples: &mut TupleArena) -> Result<(), String> {
-        if let Some(tuple) = tuples.get_tuple_mut(tuple_index) {
+    #[inline]
+    pub fn schedule_insert(&mut self, tuple_index: SafeTupleIndex, tuples: &mut TupleArena) -> Result<()> {
+        if let Ok(tuple) = tuples.get_tuple_mut_checked(tuple_index) {
             if !tuple.state().is_dirty() {
                 tuple.set_state(TupleState::Creating);
                 self.pending_queue.push_back(tuple_index);
                 Ok(())
             } else {
-                Err("Tuple is already in a dirty state".to_string())
+                Err(GreynetError::scheduler_error("Tuple is already in a dirty state"))
             }
         } else {
-            Err("Invalid tuple index".to_string())
+            Err(GreynetError::invalid_index("Invalid tuple index for scheduling"))
         }
     }
 
-    pub fn schedule_retract(&mut self, tuple_index: SafeTupleIndex, tuples: &mut TupleArena) -> Result<(), String> {
-        if let Some(tuple) = tuples.get_tuple_mut(tuple_index) {
+    #[inline]
+    pub fn schedule_retract(&mut self, tuple_index: SafeTupleIndex, tuples: &mut TupleArena) -> Result<()> {
+        if let Ok(tuple) = tuples.get_tuple_mut_checked(tuple_index) {
             match tuple.state() {
                 TupleState::Creating => {
                     tuple.set_state(TupleState::Aborting);
@@ -43,32 +98,45 @@ impl BatchScheduler {
                     self.pending_queue.push_back(tuple_index);
                     Ok(())
                 }
-                _ => Err("Tuple cannot be retracted in current state".to_string()),
+                state => Err(GreynetError::scheduler_error(
+                    format!("Tuple cannot be retracted in state: {:?}", state)
+                )),
             }
         } else {
-            Err("Invalid tuple index".to_string())
+            Err(GreynetError::invalid_index("Invalid tuple index for retraction"))
         }
     }
 
-    pub fn execute_all<S: Score>(&mut self, nodes: &mut NodeArena<S>, tuples: &mut TupleArena) -> Result<(), String> {
+    // IMPROVED: Add infinite loop prevention and resource limits
+    pub fn execute_all<S: Score>(&mut self, nodes: &mut NodeArena<S>, tuples: &mut TupleArena) -> Result<()> {
+        let mut iteration_count = 0;
+        
         while !self.pending_queue.is_empty() {
-            self.prepare_operations(nodes, tuples);
+            iteration_count += 1;
+            if iteration_count > self.limits.max_cascade_depth {
+                return Err(GreynetError::infinite_loop(self.limits.max_cascade_depth));
+            }
+            
+            // Check operation limits
+            self.limits.check_operation_limit(self.operation_queue.len())?;
+            
+            self.prepare_operations(nodes, tuples)?;
             let ops_to_execute: Vec<NodeOperation> = self.operation_queue.drain(..).collect();
-            NodeArena::execute_operations(ops_to_execute, nodes, tuples);
+            NodeArena::execute_operations(ops_to_execute, nodes, tuples)?;
         }
         Ok(())
     }
 
-    fn prepare_operations<S: Score>(&mut self, nodes: &mut NodeArena<S>, tuples: &mut TupleArena) {
-        let mut dead_tuples = Vec::new();
+    fn prepare_operations<S: Score>(&mut self, nodes: &mut NodeArena<S>, tuples: &mut TupleArena) -> Result<()> {
+        let mut dead_tuples = self.pool.get_index_buffer();
         let mut processed_tuples = Vec::new();
-        let mut new_operations = Vec::new();
+        let mut new_operations = self.pool.get_operation_buffer();
 
         while let Some(tuple_index) = self.pending_queue.pop_front() {
-            let (current_state, node_id) = if let Some(tuple) = tuples.get_tuple(tuple_index) {
+            let (current_state, node_id) = if let Ok(tuple) = tuples.get_tuple_checked(tuple_index) {
                 (tuple.state(), tuple.node())
             } else {
-                continue;
+                continue; // Skip invalid indices
             };
 
             processed_tuples.push((tuple_index, current_state));
@@ -77,10 +145,10 @@ impl BatchScheduler {
                 if let Some(node) = nodes.get_node_mut(node_id) {
                     match current_state {
                         TupleState::Creating => {
-                            node.collect_insert_ops(tuple_index, tuples, &mut new_operations);
+                            node.collect_insert_ops(tuple_index, tuples, &mut new_operations)?;
                         }
                         TupleState::Dying => {
-                            node.collect_retract_ops(tuple_index, tuples, &mut new_operations);
+                            node.collect_retract_ops(tuple_index, tuples, &mut new_operations)?;
                         }
                         _ => {}
                     }
@@ -88,17 +156,19 @@ impl BatchScheduler {
             }
         }
 
-        self.operation_queue.extend(new_operations);
+        self.operation_queue.extend(new_operations.drain(..));
+        self.pool.return_operation_buffer(new_operations);
 
+        // Update states and collect dead tuples
         for (tuple_index, previous_state) in processed_tuples {
             match previous_state {
                 TupleState::Creating => {
-                    if let Some(tuple) = tuples.get_tuple_mut(tuple_index) {
+                    if let Ok(tuple) = tuples.get_tuple_mut_checked(tuple_index) {
                         tuple.set_state(TupleState::Ok);
                     }
                 }
                 TupleState::Dying | TupleState::Aborting => {
-                    if let Some(tuple) = tuples.get_tuple_mut(tuple_index) {
+                    if let Ok(tuple) = tuples.get_tuple_mut_checked(tuple_index) {
                         tuple.set_state(TupleState::Dead);
                     }
                     dead_tuples.push(tuple_index);
@@ -107,19 +177,32 @@ impl BatchScheduler {
             }
         }
 
-        for tuple_index in dead_tuples {
-            tuples.release_tuple(tuple_index);
+        // Release dead tuples
+        for tuple_index in dead_tuples.iter() {
+            tuples.release_tuple(*tuple_index);
+        }
+        
+        self.pool.return_index_buffer(dead_tuples);
+        Ok(())
+    }
+    
+    /// Get current scheduler statistics
+    pub fn stats(&self) -> SchedulerStats {
+        SchedulerStats {
+            pending_operations: self.pending_queue.len(),
+            queued_operations: self.operation_queue.len(),
+            operation_buffers_pooled: self.pool.operation_buffers.len(),
+            index_buffers_pooled: self.pool.index_buffers.len(),
         }
     }
 }
 
-impl std::fmt::Debug for BatchScheduler {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BatchScheduler")
-            .field("pending_queue_size", &self.pending_queue.len())
-            .field("operation_queue_size", &self.operation_queue.len())
-            .finish()
-    }
+#[derive(Debug, Clone)]
+pub struct SchedulerStats {
+    pub pending_operations: usize,
+    pub queued_operations: usize,
+    pub operation_buffers_pooled: usize,
+    pub index_buffers_pooled: usize,
 }
 
 impl Default for BatchScheduler {

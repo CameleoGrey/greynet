@@ -1,8 +1,9 @@
 //advanced_index.rs
 use super::arena::SafeTupleIndex;
 use super::joiner::JoinerType;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::hash::Hash;
+use rustc_hash::FxHashMap as HashMap;
 
 #[derive(Debug)]
 pub enum AdvancedIndex<K: Ord + Hash> {
@@ -21,7 +22,7 @@ impl<K: Ord + Hash + Copy> AdvancedIndex<K> {
             }
             JoinerType::NotEqual => AdvancedIndex::NotEqual {
                 all_tuples: Vec::new(),
-                key_map: HashMap::new(),
+                key_map: HashMap::default(),
             },
             _ => panic!("AdvancedIndex does not support joiner type: {:?}", joiner_type),
         }
