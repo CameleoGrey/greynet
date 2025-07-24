@@ -1,20 +1,36 @@
-//collectors.rs
+// collectors.rs
+
 use crate::tuple::FactIterator;
 use crate::{AnyTuple, GreynetFact};
 use rustc_hash::FxHashMap as HashMap;
-use std::cell::RefCell;
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
+use std::collections::hash_map::DefaultHasher;
 
+// NEW: A receipt that can be used to undo an insertion. Its meaning is
+// specific to each collector. For many, it's a unique ID for the insertion.
+// For others, it can encode the value that was added.
+pub type UndoReceipt = u64;
+
+// MODIFIED: BaseCollector trait no longer returns a boxed closure.
+// Instead, insert returns a receipt, and a new `remove` method accepts that receipt.
 pub trait BaseCollector: std::fmt::Debug {
-    fn insert(&mut self, item: &AnyTuple) -> UndoFunction;
+    /// Inserts an item into the collector and returns a receipt for undoing the operation.
+    fn insert(&mut self, item: &AnyTuple) -> UndoReceipt;
+
+    /// Removes a previously inserted item using its receipt.
+    /// The original item is passed back to avoid storing data inside the receipt itself.
+    fn remove(&mut self, item: &AnyTuple, receipt: UndoReceipt);
+
+    /// Returns the aggregated result as a GreynetFact.
     fn result_as_fact(&self) -> Rc<dyn GreynetFact>;
+
+    /// Checks if the collector is empty.
     fn is_empty(&self) -> bool;
 }
 
-/// High-performance enum dispatch for common collectors
+// MODIFIED: FastCollector enum dispatch updated to the new trait methods.
 #[derive(Debug)]
 pub enum FastCollector {
     Count(CountCollector),
@@ -25,12 +41,22 @@ pub enum FastCollector {
 
 impl BaseCollector for FastCollector {
     #[inline]
-    fn insert(&mut self, item: &AnyTuple) -> UndoFunction {
+    fn insert(&mut self, item: &AnyTuple) -> UndoReceipt {
         match self {
             FastCollector::Count(c) => c.insert(item),
             FastCollector::Sum(c) => c.insert(item),
             FastCollector::List(c) => c.insert(item),
             FastCollector::Custom(c) => c.insert(item),
+        }
+    }
+
+    #[inline]
+    fn remove(&mut self, item: &AnyTuple, receipt: UndoReceipt) {
+        match self {
+            FastCollector::Count(c) => c.remove(item, receipt),
+            FastCollector::Sum(c) => c.remove(item, receipt),
+            FastCollector::List(c) => c.remove(item, receipt),
+            FastCollector::Custom(c) => c.remove(item, receipt),
         }
     }
 
@@ -55,57 +81,43 @@ impl BaseCollector for FastCollector {
     }
 }
 
-pub struct UndoFunction {
-    undo_fn: Box<dyn FnOnce()>,
-}
-
-impl UndoFunction {
-    #[inline]
-    pub fn new<F: FnOnce() + 'static>(f: F) -> Self {
-        Self {
-            undo_fn: Box::new(f),
-        }
-    }
-
-    #[inline]
-    pub fn execute(self) {
-        (self.undo_fn)();
-    }
-}
-
+// MODIFIED: CountCollector no longer uses Rc<RefCell<...>>.
 #[derive(Default, Debug)]
 pub struct CountCollector {
-    count: Rc<RefCell<usize>>,
+    count: usize,
 }
 
 impl BaseCollector for CountCollector {
     #[inline]
-    fn insert(&mut self, _item: &AnyTuple) -> UndoFunction {
-        *self.count.borrow_mut() += 1;
-        let count = self.count.clone();
-        UndoFunction::new(move || {
-            *count.borrow_mut() -= 1;
-        })
+    fn insert(&mut self, _item: &AnyTuple) -> UndoReceipt {
+        self.count += 1;
+        0 // Receipt is not used for this simple collector.
+    }
+
+    #[inline]
+    fn remove(&mut self, _item: &AnyTuple, _receipt: UndoReceipt) {
+        self.count = self.count.saturating_sub(1);
     }
 
     #[inline]
     fn result_as_fact(&self) -> Rc<dyn GreynetFact> {
-        Rc::new(*self.count.borrow())
+        Rc::new(self.count)
     }
 
     #[inline]
     fn is_empty(&self) -> bool {
-        *self.count.borrow() == 0
+        self.count == 0
     }
 }
 
+// MODIFIED: SumCollector no longer uses Rc<RefCell<...>>.
 pub struct SumCollector<F>
 where
     F: Fn(&AnyTuple) -> f64 + 'static,
 {
     mapping_function: F,
-    total: Rc<RefCell<f64>>,
-    count: Rc<RefCell<usize>>,
+    total: f64,
+    count: usize,
 }
 
 impl<F> std::fmt::Debug for SumCollector<F>
@@ -126,36 +138,40 @@ where
     F: Fn(&AnyTuple) -> f64 + 'static,
 {
     #[inline]
-    fn insert(&mut self, item: &AnyTuple) -> UndoFunction {
+    fn insert(&mut self, item: &AnyTuple) -> UndoReceipt {
         let value = (self.mapping_function)(item);
-        *self.total.borrow_mut() += value;
-        *self.count.borrow_mut() += 1;
-        let total = self.total.clone();
-        let count = self.count.clone();
-        UndoFunction::new(move || {
-            *total.borrow_mut() -= value;
-            *count.borrow_mut() -= 1;
-        })
+        self.total += value;
+        self.count += 1;
+        // The receipt encodes the added value to be used for removal.
+        value.to_bits()
+    }
+
+    #[inline]
+    fn remove(&mut self, _item: &AnyTuple, receipt: UndoReceipt) {
+        let value_to_remove = f64::from_bits(receipt);
+        self.total -= value_to_remove;
+        self.count = self.count.saturating_sub(1);
     }
 
     #[inline]
     fn result_as_fact(&self) -> Rc<dyn GreynetFact> {
-        Rc::new(*self.total.borrow())
+        Rc::new(self.total)
     }
 
     #[inline]
     fn is_empty(&self) -> bool {
-        *self.count.borrow() == 0
+        self.count == 0
     }
 }
 
+// MODIFIED: AvgCollector no longer uses Rc<RefCell<...>>.
 pub struct AvgCollector<F>
 where
     F: Fn(&AnyTuple) -> f64 + 'static,
 {
     mapping_function: F,
-    total: Rc<RefCell<f64>>,
-    count: Rc<RefCell<usize>>,
+    total: f64,
+    count: usize,
 }
 
 impl<F> std::fmt::Debug for AvgCollector<F>
@@ -175,74 +191,80 @@ impl<F> BaseCollector for AvgCollector<F>
 where
     F: Fn(&AnyTuple) -> f64 + 'static,
 {
-    fn insert(&mut self, item: &AnyTuple) -> UndoFunction {
+    fn insert(&mut self, item: &AnyTuple) -> UndoReceipt {
         let value = (self.mapping_function)(item);
-        *self.total.borrow_mut() += value;
-        *self.count.borrow_mut() += 1;
-        let total = self.total.clone();
-        let count = self.count.clone();
-        UndoFunction::new(move || {
-            *total.borrow_mut() -= value;
-            *count.borrow_mut() -= 1;
-        })
+        self.total += value;
+        self.count += 1;
+        value.to_bits()
+    }
+
+    fn remove(&mut self, _item: &AnyTuple, receipt: UndoReceipt) {
+        let value_to_remove = f64::from_bits(receipt);
+        self.total -= value_to_remove;
+        self.count = self.count.saturating_sub(1);
     }
 
     fn result_as_fact(&self) -> Rc<dyn GreynetFact> {
-        let total = *self.total.borrow();
-        let count = *self.count.borrow();
-        if count == 0 {
+        if self.count == 0 {
             Rc::new(0.0)
         } else {
-            Rc::new(total / count as f64)
+            Rc::new(self.total / self.count as f64)
         }
     }
 
     fn is_empty(&self) -> bool {
-        *self.count.borrow() == 0
+        self.count == 0
     }
 }
 
-// OPTIMIZATION (Guide 5.1): Update ListCollector to remove atomic dependency
-// and use a simpler wrapping counter.
+// MODIFIED: ListCollector uses HashMap for O(1) removal and no longer uses Rc<RefCell<...>>.
 #[derive(Default, Debug)]
 pub struct ListCollector {
-    items: Rc<RefCell<Vec<(u64, AnyTuple)>>>,
-    next_id: Rc<RefCell<u64>>,
+    items: HashMap<u64, AnyTuple>,
+    // We still need insertion order for the result.
+    insertion_order: Vec<u64>,
+    next_id: u64,
 }
 
 impl BaseCollector for ListCollector {
-    fn insert(&mut self, item: &AnyTuple) -> UndoFunction {
-        let mut next_id = self.next_id.borrow_mut();
-        let item_id = *next_id;
-        *next_id = next_id.wrapping_add(1);
-        drop(next_id);
+    fn insert(&mut self, item: &AnyTuple) -> UndoReceipt {
+        let item_id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
 
-        self.items.borrow_mut().push((item_id, item.clone()));
+        self.items.insert(item_id, item.clone());
+        self.insertion_order.push(item_id);
+        
+        item_id
+    }
 
-        let items = self.items.clone();
-        UndoFunction::new(move || {
-            items.borrow_mut().retain(|(id, _)| *id != item_id);
-        })
+    fn remove(&mut self, _item: &AnyTuple, receipt: UndoReceipt) {
+        let item_id = receipt;
+        if self.items.remove(&item_id).is_some() {
+            self.insertion_order.retain(|id| *id != item_id);
+        }
     }
 
     fn result_as_fact(&self) -> Rc<dyn GreynetFact> {
-        let items = self.items.borrow();
-        let tuples: Vec<AnyTuple> = items.iter().map(|(_, tuple)| tuple.clone()).collect();
+        let tuples: Vec<AnyTuple> = self.insertion_order
+            .iter()
+            .filter_map(|id| self.items.get(id).cloned())
+            .collect();
         Rc::new(tuples)
     }
 
     fn is_empty(&self) -> bool {
-        self.items.borrow().is_empty()
+        self.items.is_empty()
     }
 }
 
+// MODIFIED: MinCollector no longer uses Rc<RefCell<...>>.
 pub struct MinCollector<K, F>
 where
     K: Ord + Clone + GreynetFact,
     F: Fn(&AnyTuple) -> K + 'static,
 {
     mapping_function: F,
-    counts: Rc<RefCell<BTreeMap<K, usize>>>,
+    counts: BTreeMap<K, usize>,
 }
 
 impl<K, F> std::fmt::Debug for MinCollector<K, F>
@@ -263,24 +285,24 @@ where
     K: Ord + Clone + GreynetFact,
     F: Fn(&AnyTuple) -> K + 'static,
 {
-    fn insert(&mut self, item: &AnyTuple) -> UndoFunction {
+    fn insert(&mut self, item: &AnyTuple) -> UndoReceipt {
         let key = (self.mapping_function)(item);
-        *self.counts.borrow_mut().entry(key.clone()).or_insert(0) += 1;
-        let counts = self.counts.clone();
-        UndoFunction::new(move || {
-            let mut counts_borrowed = counts.borrow_mut();
-            if let Some(count) = counts_borrowed.get_mut(&key) {
-                *count -= 1;
-                if *count == 0 {
-                    counts_borrowed.remove(&key);
-                }
+        *self.counts.entry(key).or_insert(0) += 1;
+        0 // Receipt is not used; key is recalculated on remove.
+    }
+
+    fn remove(&mut self, item: &AnyTuple, _receipt: UndoReceipt) {
+        let key = (self.mapping_function)(item);
+        if let Some(count) = self.counts.get_mut(&key) {
+            *count -= 1;
+            if *count == 0 {
+                self.counts.remove(&key);
             }
-        })
+        }
     }
 
     fn result_as_fact(&self) -> Rc<dyn GreynetFact> {
-        let counts = self.counts.borrow();
-        if let Some(min_key) = counts.keys().next() {
+        if let Some(min_key) = self.counts.keys().next() {
             Rc::new(min_key.clone())
         } else {
             panic!("Collector result called on empty group")
@@ -288,17 +310,18 @@ where
     }
 
     fn is_empty(&self) -> bool {
-        self.counts.borrow().is_empty()
+        self.counts.is_empty()
     }
 }
 
+// MODIFIED: MaxCollector no longer uses Rc<RefCell<...>>.
 pub struct MaxCollector<K, F>
 where
     K: Ord + Clone + GreynetFact,
     F: Fn(&AnyTuple) -> K + 'static,
 {
     mapping_function: F,
-    counts: Rc<RefCell<BTreeMap<K, usize>>>,
+    counts: BTreeMap<K, usize>,
 }
 
 impl<K, F> std::fmt::Debug for MaxCollector<K, F>
@@ -319,24 +342,24 @@ where
     K: Ord + Clone + GreynetFact,
     F: Fn(&AnyTuple) -> K + 'static,
 {
-    fn insert(&mut self, item: &AnyTuple) -> UndoFunction {
+    fn insert(&mut self, item: &AnyTuple) -> UndoReceipt {
         let key = (self.mapping_function)(item);
-        *self.counts.borrow_mut().entry(key.clone()).or_insert(0) += 1;
-        let counts = self.counts.clone();
-        UndoFunction::new(move || {
-            let mut counts_borrowed = counts.borrow_mut();
-            if let Some(count) = counts_borrowed.get_mut(&key) {
-                *count -= 1;
-                if *count == 0 {
-                    counts_borrowed.remove(&key);
-                }
+        *self.counts.entry(key).or_insert(0) += 1;
+        0 // Receipt is not used.
+    }
+
+    fn remove(&mut self, item: &AnyTuple, _receipt: UndoReceipt) {
+        let key = (self.mapping_function)(item);
+        if let Some(count) = self.counts.get_mut(&key) {
+            *count -= 1;
+            if *count == 0 {
+                self.counts.remove(&key);
             }
-        })
+        }
     }
 
     fn result_as_fact(&self) -> Rc<dyn GreynetFact> {
-        let counts = self.counts.borrow();
-        if let Some(max_key) = counts.keys().last() {
+        if let Some(max_key) = self.counts.keys().last() {
             Rc::new(max_key.clone())
         } else {
             panic!("Collector result called on empty group")
@@ -344,50 +367,42 @@ where
     }
 
     fn is_empty(&self) -> bool {
-        self.counts.borrow().is_empty()
+        self.counts.is_empty()
     }
 }
 
-#[derive(Default)]
+// MODIFIED: SetCollector no longer uses Rc<RefCell<...>>.
+#[derive(Default, Debug)]
 pub struct SetCollector {
-    items: Rc<RefCell<HashSet<u64>>>,
-    tuple_hashes: Rc<RefCell<HashMap<u64, usize>>>,
-}
-
-impl std::fmt::Debug for SetCollector {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SetCollector")
-            .field("items", &self.items)
-            .field("tuple_hashes", &self.tuple_hashes)
-            .finish()
-    }
+    items: HashSet<u64>,
+    tuple_hashes: HashMap<u64, usize>,
 }
 
 impl BaseCollector for SetCollector {
-    fn insert(&mut self, item: &AnyTuple) -> UndoFunction {
+    fn insert(&mut self, item: &AnyTuple) -> UndoReceipt {
         let item_hash = Self::hash_tuple(item);
-        self.items.borrow_mut().insert(item_hash);
-        *self.tuple_hashes.borrow_mut().entry(item_hash).or_insert(0) += 1;
-        let items_ref = self.items.clone();
-        let hashes_ref = self.tuple_hashes.clone();
-        UndoFunction::new(move || {
-            let mut hashes_borrowed = hashes_ref.borrow_mut();
-            if let Some(count) = hashes_borrowed.get_mut(&item_hash) {
-                *count -= 1;
-                if *count == 0 {
-                    hashes_borrowed.remove(&item_hash);
-                    items_ref.borrow_mut().remove(&item_hash);
-                }
+        self.items.insert(item_hash);
+        *self.tuple_hashes.entry(item_hash).or_insert(0) += 1;
+        item_hash
+    }
+
+    fn remove(&mut self, _item: &AnyTuple, receipt: UndoReceipt) {
+        let item_hash = receipt;
+        if let Some(count) = self.tuple_hashes.get_mut(&item_hash) {
+            *count -= 1;
+            if *count == 0 {
+                self.tuple_hashes.remove(&item_hash);
+                self.items.remove(&item_hash);
             }
-        })
+        }
     }
 
     fn result_as_fact(&self) -> Rc<dyn GreynetFact> {
-        Rc::new(self.items.borrow().len())
+        Rc::new(self.items.len())
     }
 
     fn is_empty(&self) -> bool {
-        self.items.borrow().is_empty()
+        self.items.is_empty()
     }
 }
 
@@ -401,60 +416,48 @@ impl SetCollector {
     }
 }
 
-#[derive(Default)]
+// MODIFIED: DistinctCollector no longer uses Rc<RefCell<...>>.
+#[derive(Default, Debug)]
 pub struct DistinctCollector {
-    items: Rc<RefCell<HashMap<u64, AnyTuple>>>,
-    insertion_order: Rc<RefCell<Vec<u64>>>,
-    counts: Rc<RefCell<HashMap<u64, usize>>>,
-}
-
-impl std::fmt::Debug for DistinctCollector {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DistinctCollector")
-            .field("items", &self.items)
-            .field("insertion_order", &self.insertion_order)
-            .field("counts", &self.counts)
-            .finish()
-    }
+    items: HashMap<u64, AnyTuple>,
+    insertion_order: Vec<u64>,
+    counts: HashMap<u64, usize>,
 }
 
 impl BaseCollector for DistinctCollector {
-    fn insert(&mut self, item: &AnyTuple) -> UndoFunction {
+    fn insert(&mut self, item: &AnyTuple) -> UndoReceipt {
         let item_hash = SetCollector::hash_tuple(item);
-        let mut items = self.items.borrow_mut();
-        if !items.contains_key(&item_hash) {
-            items.insert(item_hash, item.clone());
-            self.insertion_order.borrow_mut().push(item_hash);
+        if !self.items.contains_key(&item_hash) {
+            self.items.insert(item_hash, item.clone());
+            self.insertion_order.push(item_hash);
         }
-        *self.counts.borrow_mut().entry(item_hash).or_insert(0) += 1;
-        let items_ref = self.items.clone();
-        let order_ref = self.insertion_order.clone();
-        let counts_ref = self.counts.clone();
-        UndoFunction::new(move || {
-            let mut counts_borrowed = counts_ref.borrow_mut();
-            if let Some(count) = counts_borrowed.get_mut(&item_hash) {
-                *count -= 1;
-                if *count == 0 {
-                    counts_borrowed.remove(&item_hash);
-                    items_ref.borrow_mut().remove(&item_hash);
-                    order_ref.borrow_mut().retain(|h| h != &item_hash);
-                }
+        *self.counts.entry(item_hash).or_insert(0) += 1;
+        item_hash
+    }
+
+    fn remove(&mut self, _item: &AnyTuple, receipt: UndoReceipt) {
+        let item_hash = receipt;
+        if let Some(count) = self.counts.get_mut(&item_hash) {
+            *count -= 1;
+            if *count == 0 {
+                self.counts.remove(&item_hash);
+                self.items.remove(&item_hash);
+                self.insertion_order.retain(|h| h != &item_hash);
             }
-        })
+        }
     }
 
     fn result_as_fact(&self) -> Rc<dyn GreynetFact> {
-        let items = self.items.borrow();
-        let order = self.insertion_order.borrow();
-        let tuples: Vec<AnyTuple> = order
+        let tuples: Vec<AnyTuple> = self
+            .insertion_order
             .iter()
-            .filter_map(|hash| items.get(hash).cloned())
+            .filter_map(|hash| self.items.get(hash).cloned())
             .collect();
         Rc::new(tuples)
     }
 
     fn is_empty(&self) -> bool {
-        self.items.borrow().is_empty()
+        self.items.is_empty()
     }
 }
 
@@ -473,8 +476,8 @@ impl Collectors {
         Box::new(move || {
             Box::new(SumCollector {
                 mapping_function: mapping_function.clone(),
-                total: Rc::new(RefCell::new(0.0)),
-                count: Rc::new(RefCell::new(0)),
+                total: 0.0,
+                count: 0,
             })
         })
     }
@@ -486,8 +489,8 @@ impl Collectors {
         Box::new(move || {
             Box::new(AvgCollector {
                 mapping_function: mapping_function.clone(),
-                total: Rc::new(RefCell::new(0.0)),
-                count: Rc::new(RefCell::new(0)),
+                total: 0.0,
+                count: 0,
             })
         })
     }
@@ -504,7 +507,7 @@ impl Collectors {
         Box::new(move || {
             Box::new(MinCollector {
                 mapping_function: mapping_function.clone(),
-                counts: Rc::new(RefCell::new(BTreeMap::new())),
+                counts: BTreeMap::new(),
             })
         })
     }
@@ -517,7 +520,7 @@ impl Collectors {
         Box::new(move || {
             Box::new(MaxCollector {
                 mapping_function: mapping_function.clone(),
-                counts: Rc::new(RefCell::new(BTreeMap::new())),
+                counts: BTreeMap::new(),
             })
         })
     }
@@ -530,12 +533,12 @@ impl Collectors {
         Box::new(|| Box::new(DistinctCollector::default()))
     }
 
-    // OPTIMIZATION (Guide 5.2): Add factories that pre-size collectors.
     pub fn list_with_capacity(capacity: usize) -> Box<dyn Fn() -> Box<dyn BaseCollector>> {
         Box::new(move || {
             Box::new(ListCollector {
-                items: Rc::new(RefCell::new(Vec::with_capacity(capacity))),
-                next_id: Rc::new(RefCell::new(0)),
+                items: HashMap::default(),
+                insertion_order: Vec::with_capacity(capacity),
+                next_id: 0,
             })
         })
     }
@@ -543,12 +546,11 @@ impl Collectors {
     pub fn set_with_capacity(capacity: usize) -> Box<dyn Fn() -> Box<dyn BaseCollector>> {
         Box::new(move || {
             Box::new(SetCollector {
-                items: Rc::new(RefCell::new(HashSet::with_capacity(capacity))),
-                // FIX: Use with_capacity_and_hasher for FxHashMap
-                tuple_hashes: Rc::new(RefCell::new(HashMap::with_capacity_and_hasher(
+                items: HashSet::with_capacity(capacity),
+                tuple_hashes: HashMap::with_capacity_and_hasher(
                     capacity,
                     Default::default(),
-                ))),
+                ),
             })
         })
     }
@@ -556,17 +558,15 @@ impl Collectors {
     pub fn distinct_with_capacity(capacity: usize) -> Box<dyn Fn() -> Box<dyn BaseCollector>> {
         Box::new(move || {
             Box::new(DistinctCollector {
-                // FIX: Use with_capacity_and_hasher for FxHashMap
-                items: Rc::new(RefCell::new(HashMap::with_capacity_and_hasher(
+                items: HashMap::with_capacity_and_hasher(
                     capacity,
                     Default::default(),
-                ))),
-                insertion_order: Rc::new(RefCell::new(Vec::with_capacity(capacity))),
-                // FIX: Use with_capacity_and_hasher for FxHashMap
-                counts: Rc::new(RefCell::new(HashMap::with_capacity_and_hasher(
+                ),
+                insertion_order: Vec::with_capacity(capacity),
+                counts: HashMap::with_capacity_and_hasher(
                     capacity,
                     Default::default(),
-                ))),
+                ),
             })
         })
     }

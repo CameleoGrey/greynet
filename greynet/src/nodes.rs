@@ -1,6 +1,6 @@
 use super::advanced_index::AdvancedIndex;
 use super::arena::{NodeId, NodeOperation, SafeTupleIndex, TupleArena};
-use super::collectors::{BaseCollector, UndoFunction};
+use super::collectors::BaseCollector;
 use super::joiner::JoinerType;
 use super::stream_def::CollectorSupplier;
 use super::tuple::BiTuple;
@@ -17,6 +17,7 @@ use std::any::TypeId;
 use std::cell::RefCell;
 use std::rc::Rc;
 use crate::SimdOps;
+use crate::collectors::UndoReceipt;
 
 // --- Function Types ---
 
@@ -558,10 +559,11 @@ impl std::fmt::Debug for ConditionalNode {
 
 pub struct GroupNode {
     pub children: Vec<NodeId>,
-    key_fn: KeyFn, // UPDATED
+    key_fn: KeyFn,
     collector_supplier: CollectorSupplier,
     groups: HashMap<u64, Box<dyn BaseCollector>>,
-    tuple_to_undo: HashMap<SafeTupleIndex, (u64, UndoFunction)>,
+    // MODIFIED: This map now stores the receipt instead of a boxed closure.
+    tuple_to_receipt: HashMap<SafeTupleIndex, (u64, UndoReceipt)>,
     group_key_to_tuple: HashMap<u64, SafeTupleIndex>,
 }
 
@@ -572,11 +574,12 @@ impl GroupNode {
             key_fn,
             collector_supplier,
             groups: HashMap::default(),
-            tuple_to_undo: HashMap::default(),
+            tuple_to_receipt: HashMap::default(),
             group_key_to_tuple: HashMap::default(),
         }
     }
 
+    // MODIFIED: insert_collect_ops now stores an UndoReceipt.
     pub fn insert_collect_ops(
         &mut self,
         tuple_index: SafeTupleIndex,
@@ -584,28 +587,33 @@ impl GroupNode {
         operations: &mut Vec<NodeOperation>,
     ) -> Result<()> {
         let parent_tuple = tuples.get_tuple_checked(tuple_index)?;
-        // UPDATED: Execute key function via enum wrapper
         let key = self.key_fn.execute(parent_tuple);
 
         let collector = self
             .groups
             .entry(key)
             .or_insert_with(|| self.collector_supplier.create());
-        let undo_fn = collector.insert(parent_tuple);
-        self.tuple_to_undo.insert(tuple_index, (key, undo_fn));
+        
+        let receipt = collector.insert(parent_tuple);
+        self.tuple_to_receipt.insert(tuple_index, (key, receipt));
         self.update_or_create_child(key, tuples, operations)?;
         Ok(())
     }
 
-    // ... other methods in GroupNode are unchanged but rely on the updated key_fn ...
+    // MODIFIED: retract_collect_ops now calls the collector's `remove` method.
     pub fn retract_collect_ops(
         &mut self,
         tuple_index: SafeTupleIndex,
         tuples: &mut TupleArena,
         operations: &mut Vec<NodeOperation>,
     ) -> Result<()> {
-        if let Some((key, undo_fn)) = self.tuple_to_undo.remove(&tuple_index) {
-            undo_fn.execute();
+        if let Some((key, receipt)) = self.tuple_to_receipt.remove(&tuple_index) {
+            // Fetch the parent tuple to pass to the collector's remove method.
+            let parent_tuple = tuples.get_tuple_checked(tuple_index)?;
+            if let Some(collector) = self.groups.get_mut(&key) {
+                collector.remove(parent_tuple, receipt);
+            }
+
             let is_empty = self.groups.get(&key).map_or(true, |c| c.is_empty());
 
             if is_empty {
@@ -628,6 +636,7 @@ impl GroupNode {
         Ok(())
     }
 
+    // This method remains the same internally.
     fn update_or_create_child(
         &mut self,
         key: u64,
@@ -691,6 +700,7 @@ impl std::fmt::Debug for GroupNode {
             .finish()
     }
 }
+
 
 // FlatMapNode and ScoringNode remain largely the same as they don't use
 // the predicate/key function pattern in the same way.

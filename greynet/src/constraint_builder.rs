@@ -85,11 +85,6 @@ impl<S: Score + 'static> ConstraintBuilder<S> {
         {
             // Could do SIMD feature detection here
             if cfg!(target_arch = "x86_64") {
-                // Log SIMD capabilities
-                println!("SIMD optimizations available: AVX2={}, SSE2={}", 
-                    std::arch::is_x86_feature_detected!("avx2"),
-                    std::arch::is_x86_feature_detected!("sse2")
-                );
             }
         }
         
