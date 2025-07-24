@@ -1,44 +1,31 @@
-//nodes.rs
+// nodes.rs
 use super::advanced_index::AdvancedIndex;
 use super::arena::{NodeId, NodeOperation, SafeTupleIndex, TupleArena};
 use super::collectors::{BaseCollector, UndoFunction};
 use super::joiner::JoinerType;
+use super::stream_def::CollectorSupplier;
 use super::tuple::BiTuple;
 use super::uni_index::UniIndex;
-use super::stream_def::CollectorSupplier;
 use crate::constraint::ConstraintWeights;
+use crate::packed_indices::PackedIndices;
 use crate::score::Score;
 use crate::state::TupleState;
 use crate::tuple::{AnyTuple, FactIterator};
-use crate::{Result, GreynetError};
+use crate::{GreynetError, Result};
+use rustc_hash::FxHashMap as HashMap;
+use smallvec::SmallVec;
 use std::any::TypeId;
 use std::cell::RefCell;
-use rustc_hash::FxHashMap as HashMap;
 use std::rc::Rc;
-
-/// Optimized enum dispatch for key functions
-#[derive(Clone)]
-pub enum KeyFunction {
-    HashBased(fn(&AnyTuple) -> u64),
-    FieldExtractor(fn(&AnyTuple) -> u64),
-    Custom(Rc<dyn Fn(&AnyTuple) -> u64>),
-}
-
-impl KeyFunction {
-    #[inline]
-    pub fn extract(&self, tuple: &AnyTuple) -> u64 {
-        match self {
-            KeyFunction::HashBased(f) => f(tuple),
-            KeyFunction::FieldExtractor(f) => f(tuple),
-            KeyFunction::Custom(f) => f(tuple),
-        }
-    }
-}
+use crate::SimdOps;
+use crate::tuple::ZeroCopyFacts;
 
 pub type SharedImpactFn<S> = Rc<dyn Fn(&AnyTuple) -> S>;
 pub type SharedKeyFn = Rc<dyn Fn(&AnyTuple) -> u64>;
 pub type SharedPredicate = Rc<dyn Fn(&AnyTuple) -> bool>;
 pub type SharedMapperFn = Rc<dyn Fn(&AnyTuple) -> Vec<Rc<dyn crate::fact::GreynetFact>>>;
+pub type ZeroCopyKeyFn = Rc<dyn Fn(&dyn ZeroCopyFacts) -> u64>;
+pub type ZeroCopyPredicate = Rc<dyn Fn(&dyn ZeroCopyFacts) -> bool>;
 
 #[derive(Debug)]
 pub struct FromNode {
@@ -102,9 +89,21 @@ impl FilterNode {
         operations: &mut Vec<NodeOperation>,
     ) -> Result<()> {
         if let Ok(tuple) = tuples.get_tuple_checked(tuple_index) {
+            // Use the stored predicate, not a parameter
             if (self.predicate)(tuple) {
-                for &child_id in &self.children {
-                    operations.push(NodeOperation::Insert(child_id, tuple_index));
+                // Unrolled loop for common child counts
+                match self.children.len() {
+                    0 => {},
+                    1 => operations.push(NodeOperation::Insert(self.children[0], tuple_index)),
+                    2 => {
+                        operations.push(NodeOperation::Insert(self.children[0], tuple_index));
+                        operations.push(NodeOperation::Insert(self.children[1], tuple_index));
+                    }
+                    _ => {
+                        for &child_id in &self.children {
+                            operations.push(NodeOperation::Insert(child_id, tuple_index));
+                        }
+                    }
                 }
             }
         }
@@ -139,7 +138,7 @@ impl std::fmt::Debug for FilterNode {
 }
 
 #[derive(Debug)]
-enum JoinIndex {
+pub enum JoinIndex {
     Uni(UniIndex<u64>),
     Advanced(AdvancedIndex<u64>),
 }
@@ -184,7 +183,7 @@ pub struct JoinNode {
     pub right_index: JoinIndex,
     pub left_key_fn: SharedKeyFn,
     pub right_key_fn: SharedKeyFn,
-    pub beta_memory: HashMap<(SafeTupleIndex, SafeTupleIndex), SafeTupleIndex>,
+    pub beta_memory: HashMap<PackedIndices, SafeTupleIndex>,
 }
 
 impl JoinNode {
@@ -211,22 +210,45 @@ impl JoinNode {
         operations: &mut Vec<NodeOperation>,
     ) -> Result<()> {
         let left_tuple = tuples.get_tuple_checked(tuple_index)?.clone();
+    
+        // Use the stored left_key_fn
         let key = (self.left_key_fn)(&left_tuple);
         self.left_index.put(key, tuple_index);
-
-        let right_matches = self.right_index.get_matches(key, self.joiner_type.inverse());
-        for &right_match_idx in &right_matches {
-            let right_tuple = tuples.get_tuple_checked(right_match_idx)?.clone();
-
-            match left_tuple.combine(&right_tuple) {
-                Ok(combined) => {
-                    let child_idx = tuples.acquire_tuple(combined)?;
-                    self.beta_memory.insert((tuple_index, right_match_idx), child_idx);
-                    for &child_id in self.children.iter() {
-                        operations.push(NodeOperation::Insert(child_id, child_idx));
+    
+        let right_matches: SmallVec<[SafeTupleIndex; 8]> = self
+            .right_index
+            .get_matches(key, self.joiner_type.inverse())
+            .iter()
+            .copied()
+            .collect();
+    
+        // Optimized batch operations
+        if !right_matches.is_empty() {
+            operations.reserve(right_matches.len() * self.children.len());
+            
+            for &right_match_idx in &right_matches {
+                let right_tuple = tuples.get_tuple_checked(right_match_idx)?.clone();
+    
+                if let Ok(combined) = left_tuple.combine(&right_tuple) {
+                    let child_idx = tuples.acquire_tuple_fast(combined)?;
+                    let packed = crate::packed_indices::PackedIndices::new(tuple_index, right_match_idx);
+                    self.beta_memory.insert(packed, child_idx);
+    
+                    // Unrolled loop for common cases
+                    match self.children.len() {
+                        0 => {},
+                        1 => operations.push(NodeOperation::Insert(self.children[0], child_idx)),
+                        2 => {
+                            operations.push(NodeOperation::Insert(self.children[0], child_idx));
+                            operations.push(NodeOperation::Insert(self.children[1], child_idx));
+                        }
+                        _ => {
+                            for &child_id in &self.children {
+                                operations.push(NodeOperation::Insert(child_id, child_idx));
+                            }
+                        }
                     }
                 }
-                Err(e) => return Err(e),
             }
         }
         Ok(())
@@ -239,22 +261,41 @@ impl JoinNode {
         operations: &mut Vec<NodeOperation>,
     ) -> Result<()> {
         let right_tuple = tuples.get_tuple_checked(tuple_index)?.clone();
+
         let key = (self.right_key_fn)(&right_tuple);
         self.right_index.put(key, tuple_index);
 
-        let left_matches = self.left_index.get_matches(key, self.joiner_type);
+        let left_matches: SmallVec<[SafeTupleIndex; 8]> = self
+            .left_index
+            .get_matches(key, self.joiner_type)
+            .iter()
+            .copied()
+            .collect();
+
+        if !left_matches.is_empty() && self.children.len() > 1 {
+            operations.reserve(left_matches.len() * self.children.len());
+        }
+
         for &left_match_idx in &left_matches {
             let left_tuple = tuples.get_tuple_checked(left_match_idx)?.clone();
 
-            match left_tuple.combine(&right_tuple) {
-                Ok(combined) => {
-                    let child_idx = tuples.acquire_tuple(combined)?;
-                    self.beta_memory.insert((left_match_idx, tuple_index), child_idx);
-                    for &child_id in self.children.iter() {
-                        operations.push(NodeOperation::Insert(child_id, child_idx));
+            if let Ok(combined) = left_tuple.combine(&right_tuple) {
+                let child_idx = tuples.acquire_tuple_fast(combined)?;
+                let packed = PackedIndices::new(left_match_idx, tuple_index);
+                self.beta_memory.insert(packed, child_idx);
+
+                match self.children.len() {
+                    1 => operations.push(NodeOperation::Insert(self.children[0], child_idx)),
+                    2 => {
+                        operations.push(NodeOperation::Insert(self.children[0], child_idx));
+                        operations.push(NodeOperation::Insert(self.children[1], child_idx));
+                    }
+                    _ => {
+                        for &child_id in &self.children {
+                            operations.push(NodeOperation::Insert(child_id, child_idx));
+                        }
                     }
                 }
-                Err(e) => return Err(e),
             }
         }
         Ok(())
@@ -271,16 +312,19 @@ impl JoinNode {
             self.left_index.remove(key, &tuple_index);
         }
 
-        let pairs_to_remove: Vec<_> = self
+        let pairs_to_remove: SmallVec<[PackedIndices; 16]> = self
             .beta_memory
             .keys()
-            .filter(|(left, _)| *left == tuple_index)
-            .cloned()
+            .filter(|packed| {
+                packed.left_index() == tuple_index.index.into_raw_parts().0
+                    && packed.left_generation() == tuple_index.generation
+            })
+            .copied()
             .collect();
 
-        for (left_idx, right_idx) in pairs_to_remove {
-            if let Some(child_idx) = self.beta_memory.remove(&(left_idx, right_idx)) {
-                for &child_id in self.children.iter() {
+        for packed in pairs_to_remove {
+            if let Some(child_idx) = self.beta_memory.remove(&packed) {
+                for &child_id in &self.children {
                     operations.push(NodeOperation::Retract(child_id, child_idx));
                 }
 
@@ -305,16 +349,19 @@ impl JoinNode {
             self.right_index.remove(key, &tuple_index);
         }
 
-        let pairs_to_remove: Vec<_> = self
+        let pairs_to_remove: SmallVec<[PackedIndices; 16]> = self
             .beta_memory
             .keys()
-            .filter(|(_, right)| *right == tuple_index)
-            .cloned()
+            .filter(|packed| {
+                packed.right_index() == tuple_index.index.into_raw_parts().0
+                    && packed.right_generation() == tuple_index.generation
+            })
+            .copied()
             .collect();
 
-        for (left_idx, right_idx) in pairs_to_remove {
-            if let Some(child_idx) = self.beta_memory.remove(&(left_idx, right_idx)) {
-                for &child_id in self.children.iter() {
+        for packed in pairs_to_remove {
+            if let Some(child_idx) = self.beta_memory.remove(&packed) {
+                for &child_id in &self.children {
                     operations.push(NodeOperation::Retract(child_id, child_idx));
                 }
 
@@ -334,7 +381,7 @@ impl std::fmt::Debug for JoinNode {
         f.debug_struct("JoinNode")
             .field("children", &self.children)
             .field("joiner_type", &self.joiner_type)
-            .field("beta_memory", &self.beta_memory)
+            .field("beta_memory_size", &self.beta_memory.len())
             .field("left_key_fn", &"<function>")
             .field("right_key_fn", &"<function>")
             .finish()
@@ -509,10 +556,7 @@ pub struct GroupNode {
 }
 
 impl GroupNode {
-    pub fn new(
-        key_fn: SharedKeyFn,
-        collector_supplier: CollectorSupplier,
-    ) -> Self {
+    pub fn new(key_fn: SharedKeyFn, collector_supplier: CollectorSupplier) -> Self {
         Self {
             children: Vec::new(),
             key_fn,
@@ -531,7 +575,7 @@ impl GroupNode {
     ) -> Result<()> {
         let parent_tuple = tuples.get_tuple_checked(tuple_index)?;
         let key = (self.key_fn)(parent_tuple);
-        
+
         let collector = self
             .groups
             .entry(key)
@@ -579,7 +623,9 @@ impl GroupNode {
         operations: &mut Vec<NodeOperation>,
     ) -> Result<()> {
         let new_result_fact = {
-            let collector = self.groups.get_mut(&key)
+            let collector = self
+                .groups
+                .get_mut(&key)
                 .ok_or_else(|| GreynetError::arena_error("Collector not found for key"))?;
             collector.result_as_fact()
         };
@@ -588,7 +634,11 @@ impl GroupNode {
             let old_tuple = tuples.get_tuple_checked(old_child_index)?;
             let old_result_fact = match old_tuple {
                 AnyTuple::Bi(t) => t.fact_b.clone(),
-                _ => return Err(GreynetError::type_mismatch("GroupNode child should be BiTuple")),
+                _ => {
+                    return Err(GreynetError::type_mismatch(
+                        "GroupNode child should be BiTuple",
+                    ))
+                }
             };
 
             if old_result_fact.eq_fact(&*new_result_fact) {
@@ -652,7 +702,7 @@ impl FlatMapNode {
     ) -> Result<()> {
         let parent_tuple = tuples.get_tuple_checked(parent_tuple_idx)?;
         let new_facts = (self.mapper_fn)(parent_tuple);
-        
+
         if new_facts.is_empty() {
             return Ok(());
         }
@@ -666,7 +716,8 @@ impl FlatMapNode {
                 operations.push(NodeOperation::Insert(child_id, child_idx));
             }
         }
-        self.parent_to_children_map.insert(parent_tuple_idx, child_indices);
+        self.parent_to_children_map
+            .insert(parent_tuple_idx, child_indices);
         Ok(())
     }
 
@@ -699,9 +750,9 @@ impl std::fmt::Debug for FlatMapNode {
 
 pub struct ScoringNode<S: Score> {
     pub constraint_id: String,
-    penalty_function: SharedImpactFn<S>,
-    weights: Rc<RefCell<ConstraintWeights>>,
-    matches: HashMap<SafeTupleIndex, S>,
+    pub penalty_function: SharedImpactFn<S>,
+    pub weights: Rc<RefCell<ConstraintWeights>>,
+    pub matches: HashMap<SafeTupleIndex, S>,
 }
 
 impl<S: Score> ScoringNode<S> {
@@ -747,6 +798,19 @@ impl<S: Score> ScoringNode<S> {
 
     #[inline]
     pub fn get_total_score(&self) -> S {
+        // Use SIMD for SimpleScore type
+        if cfg!(feature = "simd") && std::any::TypeId::of::<S>() == std::any::TypeId::of::<crate::SimpleScore>() {
+            let scores: Vec<f64> = self.matches.values()
+                .flat_map(|s| s.as_list())
+                .collect();
+            
+            if scores.len() > 64 { // Only use SIMD for larger datasets
+                let total = SimdOps::sum_scores_simd(&scores);
+                return S::from_list(vec![total]);
+            }
+        }
+        
+        // Original implementation for other cases
         self.matches
             .values()
             .fold(S::null_score(), |acc, score| acc + score.clone())
@@ -760,6 +824,40 @@ impl<S: Score> ScoringNode<S> {
                 *score_val = base_score.mul(weight);
             }
         }
+        Ok(())
+    }
+
+    // ADD bulk score recalculation with SIMD
+    pub fn recalculate_scores_bulk(&mut self, tuples: &TupleArena) -> Result<()> {
+        if cfg!(feature = "simd") && self.matches.len() > 32 {
+            self.recalculate_scores_simd(tuples)
+        } else {
+            self.recalculate_scores(tuples)
+        }
+    }
+
+    #[cfg(feature = "simd")]
+    fn recalculate_scores_simd(&mut self, tuples: &TupleArena) -> Result<()> {
+        let weight = self.weights.borrow().get_weight(&self.constraint_id);
+        
+        // Collect all tuples and calculate scores in batches
+        let tuple_indices: Vec<SafeTupleIndex> = self.matches.keys().copied().collect();
+        let mut new_scores = Vec::with_capacity(tuple_indices.len());
+        
+        for &tuple_idx in &tuple_indices {
+            if let Ok(tuple) = tuples.get_tuple_checked(tuple_idx) {
+                let base_score = (self.penalty_function)(tuple);
+                new_scores.push(base_score.mul(weight));
+            }
+        }
+        
+        // Update all scores at once
+        for (i, &tuple_idx) in tuple_indices.iter().enumerate() {
+            if i < new_scores.len() {
+                self.matches.insert(tuple_idx, new_scores[i].clone());
+            }
+        }
+        
         Ok(())
     }
 

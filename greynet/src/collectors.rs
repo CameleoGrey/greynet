@@ -1,16 +1,12 @@
 //collectors.rs
+use crate::tuple::FactIterator;
 use crate::{AnyTuple, GreynetFact};
-use std::cell::RefCell;
-use std::collections::BTreeMap;
-use std::rc::Rc;
-use std::collections::{HashSet, BTreeSet};
-use std::hash::Hash;
-use uuid::Uuid;
-use std::hash::Hasher;
-use std::hash::DefaultHasher;
-use std::any::Any;
 use rustc_hash::FxHashMap as HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::rc::Rc;
 
 pub trait BaseCollector: std::fmt::Debug {
     fn insert(&mut self, item: &AnyTuple) -> UndoFunction;
@@ -37,7 +33,7 @@ impl BaseCollector for FastCollector {
             FastCollector::Custom(c) => c.insert(item),
         }
     }
-    
+
     #[inline]
     fn result_as_fact(&self) -> Rc<dyn GreynetFact> {
         match self {
@@ -47,7 +43,7 @@ impl BaseCollector for FastCollector {
             FastCollector::Custom(c) => c.result_as_fact(),
         }
     }
-    
+
     #[inline]
     fn is_empty(&self) -> bool {
         match self {
@@ -66,7 +62,9 @@ pub struct UndoFunction {
 impl UndoFunction {
     #[inline]
     pub fn new<F: FnOnce() + 'static>(f: F) -> Self {
-        Self { undo_fn: Box::new(f) }
+        Self {
+            undo_fn: Box::new(f),
+        }
     }
 
     #[inline]
@@ -204,40 +202,32 @@ where
     }
 }
 
-// IMPROVED: ListCollector with O(1) undo operations using unique IDs
-static NEXT_ITEM_ID: AtomicU64 = AtomicU64::new(0);
-
+// OPTIMIZATION (Guide 5.1): Update ListCollector to remove atomic dependency
+// and use a simpler wrapping counter.
 #[derive(Default, Debug)]
 pub struct ListCollector {
-    items: Rc<RefCell<HashMap<u64, AnyTuple>>>, // Store with unique IDs for fast removal
-    insertion_order: Rc<RefCell<Vec<u64>>>, // Maintain insertion order
+    items: Rc<RefCell<Vec<(u64, AnyTuple)>>>,
+    next_id: Rc<RefCell<u64>>,
 }
 
 impl BaseCollector for ListCollector {
     fn insert(&mut self, item: &AnyTuple) -> UndoFunction {
-        let item_id = NEXT_ITEM_ID.fetch_add(1, Ordering::Relaxed);
-        let owned_item = item.clone();
-        
-        self.items.borrow_mut().insert(item_id, owned_item);
-        self.insertion_order.borrow_mut().push(item_id);
-        
+        let mut next_id = self.next_id.borrow_mut();
+        let item_id = *next_id;
+        *next_id = next_id.wrapping_add(1);
+        drop(next_id);
+
+        self.items.borrow_mut().push((item_id, item.clone()));
+
         let items = self.items.clone();
-        let insertion_order = self.insertion_order.clone();
-        
         UndoFunction::new(move || {
-            items.borrow_mut().remove(&item_id);
-            insertion_order.borrow_mut().retain(|&id| id != item_id);
+            items.borrow_mut().retain(|(id, _)| *id != item_id);
         })
     }
 
     fn result_as_fact(&self) -> Rc<dyn GreynetFact> {
         let items = self.items.borrow();
-        let order = self.insertion_order.borrow();
-        
-        let tuples: Vec<AnyTuple> = order.iter()
-            .filter_map(|&id| items.get(&id).cloned())
-            .collect();
-        
+        let tuples: Vec<AnyTuple> = items.iter().map(|(_, tuple)| tuple.clone()).collect();
         Rc::new(tuples)
     }
 
@@ -360,8 +350,8 @@ where
 
 #[derive(Default)]
 pub struct SetCollector {
-    items: Rc<RefCell<HashSet<String>>>,
-    tuple_hashes: Rc<RefCell<HashMap<String, usize>>>, // Count occurrences for proper undo
+    items: Rc<RefCell<HashSet<u64>>>,
+    tuple_hashes: Rc<RefCell<HashMap<u64, usize>>>,
 }
 
 impl std::fmt::Debug for SetCollector {
@@ -376,16 +366,10 @@ impl std::fmt::Debug for SetCollector {
 impl BaseCollector for SetCollector {
     fn insert(&mut self, item: &AnyTuple) -> UndoFunction {
         let item_hash = Self::hash_tuple(item);
-        
-        let mut items = self.items.borrow_mut();
-        let mut hashes = self.tuple_hashes.borrow_mut();
-        
-        items.insert(item_hash.clone());
-        *hashes.entry(item_hash.clone()).or_insert(0) += 1;
-        
+        self.items.borrow_mut().insert(item_hash);
+        *self.tuple_hashes.borrow_mut().entry(item_hash).or_insert(0) += 1;
         let items_ref = self.items.clone();
         let hashes_ref = self.tuple_hashes.clone();
-        
         UndoFunction::new(move || {
             let mut hashes_borrowed = hashes_ref.borrow_mut();
             if let Some(count) = hashes_borrowed.get_mut(&item_hash) {
@@ -399,8 +383,7 @@ impl BaseCollector for SetCollector {
     }
 
     fn result_as_fact(&self) -> Rc<dyn GreynetFact> {
-        let set_size = self.items.borrow().len();
-        Rc::new(set_size)
+        Rc::new(self.items.borrow().len())
     }
 
     fn is_empty(&self) -> bool {
@@ -409,21 +392,20 @@ impl BaseCollector for SetCollector {
 }
 
 impl SetCollector {
-    fn hash_tuple(tuple: &AnyTuple) -> String {
-        let facts = tuple.facts_vec();
-        let mut hash_parts = Vec::new();
-        for fact in facts {
-            hash_parts.push(fact.hash_fact().to_string());
+    fn hash_tuple(tuple: &AnyTuple) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        for fact in tuple.facts_iter() {
+            fact.hash_fact().hash(&mut hasher);
         }
-        hash_parts.join(":")
+        hasher.finish()
     }
 }
 
 #[derive(Default)]
 pub struct DistinctCollector {
-    items: Rc<RefCell<HashMap<String, AnyTuple>>>, // Use hash as key for uniqueness
-    insertion_order: Rc<RefCell<Vec<String>>>, // Maintain insertion order
-    counts: Rc<RefCell<HashMap<String, usize>>>, // Count for proper undo
+    items: Rc<RefCell<HashMap<u64, AnyTuple>>>,
+    insertion_order: Rc<RefCell<Vec<u64>>>,
+    counts: Rc<RefCell<HashMap<u64, usize>>>,
 }
 
 impl std::fmt::Debug for DistinctCollector {
@@ -439,23 +421,15 @@ impl std::fmt::Debug for DistinctCollector {
 impl BaseCollector for DistinctCollector {
     fn insert(&mut self, item: &AnyTuple) -> UndoFunction {
         let item_hash = SetCollector::hash_tuple(item);
-        
         let mut items = self.items.borrow_mut();
-        let mut order = self.insertion_order.borrow_mut();
-        let mut counts = self.counts.borrow_mut();
-        
-        let is_new = !items.contains_key(&item_hash);
-        if is_new {
-            items.insert(item_hash.clone(), item.clone());
-            order.push(item_hash.clone());
+        if !items.contains_key(&item_hash) {
+            items.insert(item_hash, item.clone());
+            self.insertion_order.borrow_mut().push(item_hash);
         }
-        
-        *counts.entry(item_hash.clone()).or_insert(0) += 1;
-        
+        *self.counts.borrow_mut().entry(item_hash).or_insert(0) += 1;
         let items_ref = self.items.clone();
         let order_ref = self.insertion_order.clone();
         let counts_ref = self.counts.clone();
-        
         UndoFunction::new(move || {
             let mut counts_borrowed = counts_ref.borrow_mut();
             if let Some(count) = counts_borrowed.get_mut(&item_hash) {
@@ -472,11 +446,10 @@ impl BaseCollector for DistinctCollector {
     fn result_as_fact(&self) -> Rc<dyn GreynetFact> {
         let items = self.items.borrow();
         let order = self.insertion_order.borrow();
-        
-        let tuples: Vec<AnyTuple> = order.iter()
+        let tuples: Vec<AnyTuple> = order
+            .iter()
             .filter_map(|hash| items.get(hash).cloned())
             .collect();
-        
         Rc::new(tuples)
     }
 
@@ -555,5 +528,46 @@ impl Collectors {
 
     pub fn distinct() -> Box<dyn Fn() -> Box<dyn BaseCollector>> {
         Box::new(|| Box::new(DistinctCollector::default()))
+    }
+
+    // OPTIMIZATION (Guide 5.2): Add factories that pre-size collectors.
+    pub fn list_with_capacity(capacity: usize) -> Box<dyn Fn() -> Box<dyn BaseCollector>> {
+        Box::new(move || {
+            Box::new(ListCollector {
+                items: Rc::new(RefCell::new(Vec::with_capacity(capacity))),
+                next_id: Rc::new(RefCell::new(0)),
+            })
+        })
+    }
+
+    pub fn set_with_capacity(capacity: usize) -> Box<dyn Fn() -> Box<dyn BaseCollector>> {
+        Box::new(move || {
+            Box::new(SetCollector {
+                items: Rc::new(RefCell::new(HashSet::with_capacity(capacity))),
+                // FIX: Use with_capacity_and_hasher for FxHashMap
+                tuple_hashes: Rc::new(RefCell::new(HashMap::with_capacity_and_hasher(
+                    capacity,
+                    Default::default(),
+                ))),
+            })
+        })
+    }
+
+    pub fn distinct_with_capacity(capacity: usize) -> Box<dyn Fn() -> Box<dyn BaseCollector>> {
+        Box::new(move || {
+            Box::new(DistinctCollector {
+                // FIX: Use with_capacity_and_hasher for FxHashMap
+                items: Rc::new(RefCell::new(HashMap::with_capacity_and_hasher(
+                    capacity,
+                    Default::default(),
+                ))),
+                insertion_order: Rc::new(RefCell::new(Vec::with_capacity(capacity))),
+                // FIX: Use with_capacity_and_hasher for FxHashMap
+                counts: Rc::new(RefCell::new(HashMap::with_capacity_and_hasher(
+                    capacity,
+                    Default::default(),
+                ))),
+            })
+        })
     }
 }

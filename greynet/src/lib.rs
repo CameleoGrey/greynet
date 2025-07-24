@@ -28,6 +28,11 @@ pub mod stream_def;
 pub mod tuple;
 pub mod uni_index;
 pub mod utils;
+pub mod sparse_set;
+pub mod packed_indices;
+pub mod simd_ops;
+pub mod common_ops;
+pub mod streams_zero_copy;
 
 pub use error::{GreynetError, Result};
 pub use fact::GreynetFact;
@@ -45,6 +50,7 @@ pub use constraint::ConstraintWeights;
 pub use stream_def::{Stream, Arity1, Arity2, Arity3, Arity4, Arity5};
 pub use collectors::{BaseCollector, Collectors};
 pub use analysis::{ConstraintAnalysis, ConstraintViolationReport, NetworkStatistics};
+pub use simd_ops::SimdOps;
 
 /// Memory leak detection macro for debug builds
 #[macro_export]
@@ -56,6 +62,47 @@ macro_rules! assert_no_leaks {
         }
     };
 }
+
+#[macro_export]
+// OPTIMIZATION: Use a macro to generate repetitive accessor methods,
+    // ensuring identical, inlined implementations for each tuple variant.
+    macro_rules! impl_any_tuple_accessors {
+        ($($variant:ident),*) => {
+            #[inline]
+            pub fn node(&self) -> Option<NodeId> {
+                match self {
+                    $(AnyTuple::$variant(t) => t.node,)*
+                }
+            }
+
+            #[inline]
+            pub fn set_node(&mut self, node_id: NodeId) {
+                match self {
+                    $(AnyTuple::$variant(t) => t.node = Some(node_id),)*
+                }
+            }
+
+            #[inline]
+            pub fn state(&self) -> TupleState {
+                match self {
+                    $(AnyTuple::$variant(t) => t.state,)*
+                }
+            }
+
+            #[inline]
+            pub fn set_state(&mut self, state: TupleState) {
+                match self {
+                    $(AnyTuple::$variant(t) => t.state = state,)*
+                }
+            }
+
+            pub fn reset(&mut self) {
+                match self {
+                    $(AnyTuple::$variant(t) => t.reset(),)*
+                }
+            }
+        };
+    }
 
 /// Convenience function to create a new constraint builder
 pub fn builder<S: Score + 'static>() -> ConstraintBuilder<S> {

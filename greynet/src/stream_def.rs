@@ -240,7 +240,7 @@ impl FromDefinition {
 pub struct FilterDefinition<S: Score> {
     pub source: Box<StreamDefinition<S>>,
     pub predicate_id: usize,
-    _phantom: PhantomData<S>,
+    pub _phantom: PhantomData<S>,
 }
 
 #[derive(Clone)]
@@ -250,7 +250,7 @@ pub struct JoinDefinition<S: Score> {
     pub joiner_type: JoinerType,
     pub left_key_fn_id: usize,
     pub right_key_fn_id: usize,
-    _phantom: PhantomData<S>,
+    pub _phantom: PhantomData<S>,
 }
 
 #[derive(Clone)]
@@ -260,7 +260,7 @@ pub struct ConditionalJoinDefinition<S: Score> {
     pub should_exist: bool,
     pub left_key_fn_id: usize,
     pub right_key_fn_id: usize,
-    _phantom: PhantomData<S>,
+    pub _phantom: PhantomData<S>,
 }
 
 #[derive(Clone)]
@@ -268,14 +268,14 @@ pub struct GroupDefinition<S: Score> {
     pub source: Box<StreamDefinition<S>>,
     pub key_fn_id: usize,
     pub collector_supplier: CollectorSupplier, // IMPROVED: Use reliable supplier
-    _phantom: PhantomData<S>,
+    pub _phantom: PhantomData<S>,
 }
 
 #[derive(Clone)]
 pub struct FlatMapDefinition<S: Score> {
     pub source: Box<StreamDefinition<S>>,
     pub mapper_fn_id: usize,
-    _phantom: PhantomData<S>,
+    pub _phantom: PhantomData<S>,
 }
 
 /// High-level stream API for building constraint pipelines

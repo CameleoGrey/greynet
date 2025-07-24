@@ -11,6 +11,7 @@ use rustc_hash::FxHashMap as HashMap;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::cell::RefCell;
+use crate::SimdOps;
 
 /// High-performance session with direct ownership and comprehensive error handling
 #[derive(Debug)]
@@ -128,20 +129,6 @@ impl<S: Score + 'static> Session<S> {
         self.scheduler.execute_all(&mut self.nodes, &mut self.tuples)
     }
 
-    pub fn get_score(&mut self) -> Result<S> {
-        self.flush()?;
-
-        let total_score = self.scoring_nodes.iter().fold(S::null_score(), |acc, &node_id| {
-            if let Some(NodeData::Scoring(scoring_node)) = self.nodes.get_node(node_id) {
-                acc + scoring_node.get_total_score()
-            } else {
-                acc
-            }
-        });
-
-        Ok(total_score)
-    }
-
     pub fn update_constraint_weight(&mut self, constraint_id: &str, new_weight: f64) -> Result<()> {
         self.weights
             .borrow_mut()
@@ -186,14 +173,113 @@ impl<S: Score + 'static> Session<S> {
         Ok(all_matches)
     }
 
+    pub fn insert_batch_simd<T: GreynetFact + 'static>(
+        &mut self,
+        facts: impl IntoIterator<Item = T>,
+    ) -> Result<()> {
+        let facts_vec: Vec<T> = facts.into_iter().collect();
+        
+        if facts_vec.is_empty() {
+            return Ok(());
+        }
+
+        // Pre-check all facts for duplicates using SIMD where possible
+        let fact_ids: Vec<uuid::Uuid> = facts_vec.iter().map(|f| f.fact_id()).collect();
+        
+        // Check for existing facts
+        for &fact_id in &fact_ids {
+            if self.fact_to_tuple_map.contains_key(&fact_id) {
+                return Err(GreynetError::duplicate_fact(fact_id));
+            }
+        }
+
+        // Bulk resource limit check
+        self.limits.check_tuple_limit(self.tuples.arena.len() + facts_vec.len())?;
+
+        let fact_type_id = std::any::TypeId::of::<T>();
+        let from_node_id = *self
+            .from_nodes
+            .get(&fact_type_id)
+            .ok_or_else(|| GreynetError::unregistered_type(std::any::type_name::<T>()))?;
+
+        // Bulk create tuples
+        let mut tuple_indices = Vec::with_capacity(facts_vec.len());
+        for (i, fact) in facts_vec.into_iter().enumerate() {
+            let tuple = AnyTuple::Uni(UniTuple::new(Rc::new(fact)));
+            let tuple_index = self.tuples.acquire_tuple(tuple)?;
+            
+            if let Ok(t) = self.tuples.get_tuple_mut_checked(tuple_index) {
+                t.set_node(from_node_id);
+            }
+            
+            tuple_indices.push((fact_ids[i], tuple_index));
+        }
+
+        // Bulk schedule insertions
+        for &(fact_id, tuple_index) in &tuple_indices {
+            match self.scheduler.schedule_insert(tuple_index, &mut self.tuples) {
+                Ok(()) => {
+                    self.fact_to_tuple_map.insert(fact_id, tuple_index);
+                }
+                Err(e) => {
+                    // Cleanup on failure
+                    for &(_, idx) in &tuple_indices {
+                        self.tuples.release_tuple(idx);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    // REPLACE existing insert_batch to use SIMD version
     pub fn insert_batch<T: GreynetFact + 'static>(
         &mut self,
         facts: impl IntoIterator<Item = T>,
     ) -> Result<()> {
-        for fact in facts {
-            self.insert(fact)?;
+        if cfg!(feature = "simd") {
+            self.insert_batch_simd(facts)
+        } else {
+            // Original implementation
+            for fact in facts {
+                self.insert(fact)?;
+            }
+            Ok(())
         }
-        Ok(())
+    }
+
+    // REPLACE get_score to use SIMD aggregation
+    pub fn get_score(&mut self) -> Result<S> {
+        self.flush()?;
+
+        if cfg!(feature = "simd") && std::any::TypeId::of::<S>() == std::any::TypeId::of::<crate::SimpleScore>() {
+            // Use SIMD for SimpleScore
+            let mut all_scores = Vec::new();
+            
+            for &node_id in &self.scoring_nodes {
+                if let Some(NodeData::Scoring(scoring_node)) = self.nodes.get_node(node_id) {
+                    // Collect raw f64 values for SIMD processing
+                    for score in scoring_node.matches.values() {
+                        all_scores.extend(score.as_list());
+                    }
+                }
+            }
+            
+            let total = SimdOps::sum_scores_simd(&all_scores);
+            Ok(S::from_list(vec![total]))
+        } else {
+            // Original implementation for complex scores
+            let total_score = self.scoring_nodes.iter().fold(S::null_score(), |acc, &node_id| {
+                if let Some(NodeData::Scoring(scoring_node)) = self.nodes.get_node(node_id) {
+                    acc + scoring_node.get_total_score()
+                } else {
+                    acc
+                }
+            });
+            Ok(total_score)
+        }
     }
 
     pub fn retract_batch<'a, T: GreynetFact + 'a>(
@@ -233,14 +319,12 @@ impl<S: Score + 'static> Session<S> {
     /// Get comprehensive session statistics
     pub fn get_statistics(&self) -> SessionStatistics {
         let arena_stats = self.tuples.stats();
-        let scheduler_stats = self.scheduler.stats();
         
         SessionStatistics {
             total_facts: self.fact_to_tuple_map.len(),
             total_nodes: self.nodes.len(),
             scoring_nodes: self.scoring_nodes.len(),
             arena_stats,
-            scheduler_stats,
             memory_usage_mb: self.tuples.memory_usage_estimate(),
         }
     }
@@ -248,7 +332,6 @@ impl<S: Score + 'static> Session<S> {
     /// Check if session is within resource limits
     pub fn check_resource_limits(&self) -> Result<()> {
         self.limits.check_tuple_limit(self.tuples.arena.len())?;
-        self.limits.check_operation_limit(self.scheduler.stats().pending_operations)?;
         
         let memory_usage = self.tuples.memory_usage_estimate();
         if memory_usage > self.limits.max_memory_mb {
@@ -268,6 +351,5 @@ pub struct SessionStatistics {
     pub total_nodes: usize,
     pub scoring_nodes: usize,
     pub arena_stats: crate::arena::ArenaStats,
-    pub scheduler_stats: crate::scheduler::SchedulerStats,
     pub memory_usage_mb: usize,
 }

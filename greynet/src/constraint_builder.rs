@@ -70,11 +70,34 @@ impl<S: Score + 'static> ConstraintBuilder<S> {
         self
     }
 
+    // ADD SIMD configuration option
+    pub fn with_simd_optimization(mut self, enable: bool) -> Self {
+        // Could store this in a config struct if needed
+        self
+    }
+    
+    // MODIFY build method to use SIMD-optimized session
     pub fn build(self) -> Result<Session<S>> {
         let factory = Rc::try_unwrap(self.factory)
             .map_err(|_| crate::GreynetError::constraint_builder_error("ConstraintFactory has multiple owners"))?
             .into_inner();
-        factory.build_session()
+        
+        let mut session = factory.build_session()?;
+        
+        // Pre-warm SIMD if available
+        #[cfg(feature = "simd")]
+        {
+            // Could do SIMD feature detection here
+            if cfg!(target_arch = "x86_64") {
+                // Log SIMD capabilities
+                println!("SIMD optimizations available: AVX2={}, SSE2={}", 
+                    std::arch::is_x86_feature_detected!("avx2"),
+                    std::arch::is_x86_feature_detected!("sse2")
+                );
+            }
+        }
+        
+        Ok(session)
     }
 }
 

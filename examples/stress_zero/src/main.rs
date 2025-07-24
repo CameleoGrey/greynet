@@ -1,4 +1,8 @@
 use greynet::prelude::*;
+// Add new imports for the zero-copy API
+use greynet::streams_zero_copy::{ZeroCopyJoinOps, ZeroCopyStreamOps};
+use greynet::streams_zero_copy::zero_copy_ops;
+use greynet::tuple::ZeroCopyFacts;
 use greynet::{Collectors, JoinerType};
 use greynet::stream_def::ConstraintRecipe;
 use std::collections::hash_map::DefaultHasher;
@@ -8,7 +12,6 @@ use std::rc::Rc;
 use std::any::Any;
 use uuid::Uuid;
 use rand::prelude::*;
-use rand::rng;
 
 // --- Fact Definitions ---
 
@@ -132,29 +135,20 @@ impl GreynetFact for SecurityAlert {
     }
 }
 
-// --- Constraint Definitions ---
+// --- Constraint Definitions (Rewritten with Zero-Copy API) ---
 
 fn define_constraints(builder: &ConstraintBuilder<SimpleScore>) -> Vec<ConstraintRecipe<SimpleScore>> {
     let mut recipes = Vec::new();
 
-    // Constraint 1: High-value transactions (matches Java: amount > 45000)
+    // Constraint 1: High-value transactions (amount > 45000)
+    // Uses a zero-copy filter with a helper for clean field access.
     let constraint1 = builder
         .for_each::<Transaction>()
-        .filter(Rc::new(|tuple: &AnyTuple| {
-            if let AnyTuple::Uni(uni_tuple) = tuple {
-                if let Some(tx) = uni_tuple.fact_a.as_any().downcast_ref::<Transaction>() {
-                    tx.amount > 4_500_000 // 45000 * 100 (stored in cents)
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        }))
+        .filter_zero_copy(zero_copy_ops::field_check(|tx: &Transaction| tx.amount > 4_500_000))
         .penalize("high_value_transaction", |tuple: &AnyTuple| {
             if let AnyTuple::Uni(uni_tuple) = tuple {
                 if let Some(tx) = uni_tuple.fact_a.as_any().downcast_ref::<Transaction>() {
-                    SimpleScore::new(tx.amount as f64 / 100_000.0) // Convert cents to dollars then divide by 1000
+                    SimpleScore::new(tx.amount as f64 / 100_000.0)
                 } else {
                     SimpleScore::new(0.0)
                 }
@@ -164,33 +158,19 @@ fn define_constraints(builder: &ConstraintBuilder<SimpleScore>) -> Vec<Constrain
         });
     recipes.push(constraint1);
 
-    // Constraint 2: Excessive transactions per customer (matches Java exactly)
+    // Constraint 2: Excessive transactions per customer
+    // Uses a zero-copy group_by and a subsequent zero-copy filter on the result.
     let constraint2 = builder
         .for_each::<Transaction>()
-        .group_by(
-            Rc::new(|tuple: &AnyTuple| {
-                if let AnyTuple::Uni(uni_tuple) = tuple {
-                    if let Some(tx) = uni_tuple.fact_a.as_any().downcast_ref::<Transaction>() {
-                        tx.customer_id as u64
-                    } else {
-                        0
-                    }
-                } else {
-                    0
-                }
-            }),
+        .group_by_zero_copy(
+            zero_copy_ops::field_key(|tx: &Transaction| tx.customer_id),
             Collectors::count(),
         )
-        .filter(Rc::new(|tuple: &AnyTuple| {
-            if let AnyTuple::Bi(bi_tuple) = tuple {
-                if let Some(count) = bi_tuple.fact_b.as_any().downcast_ref::<usize>() {
-                    *count > 25
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
+        .filter_zero_copy(Rc::new(|tuple: &dyn ZeroCopyFacts| {
+            // The count is the second fact in the BiTuple result from group_by
+            tuple.get_fact_ref(1) 
+                .and_then(|fact| fact.as_any().downcast_ref::<usize>())
+                .map_or(false, |count| *count > 25)
         }))
         .penalize("excessive_transactions_per_customer", |tuple: &AnyTuple| {
             if let AnyTuple::Bi(bi_tuple) = tuple {
@@ -205,33 +185,22 @@ fn define_constraints(builder: &ConstraintBuilder<SimpleScore>) -> Vec<Constrain
         });
     recipes.push(constraint2);
 
-    // Constraint 3: Transactions in alerted locations (matches Java exactly)
+    // Constraint 3: Transactions in alerted locations
+    // Uses a zero-copy join with manual key functions.
     let constraint3 = builder
         .for_each::<Transaction>()
-        .join(
+        .join_zero_copy(
             builder.for_each::<SecurityAlert>(),
             JoinerType::Equal,
-            Rc::new(|tuple: &AnyTuple| {
-                if let AnyTuple::Uni(uni_tuple) = tuple {
-                    if let Some(tx) = uni_tuple.fact_a.as_any().downcast_ref::<Transaction>() {
-                        hash_string(&tx.location)
-                    } else {
-                        0
-                    }
-                } else {
-                    0
-                }
+            Rc::new(|tuple: &dyn ZeroCopyFacts| {
+                tuple.first_fact()
+                    .and_then(|fact| fact.as_any().downcast_ref::<Transaction>())
+                    .map_or(0, |tx| hash_string(&tx.location))
             }),
-            Rc::new(|tuple: &AnyTuple| {
-                if let AnyTuple::Uni(uni_tuple) = tuple {
-                    if let Some(alert) = uni_tuple.fact_a.as_any().downcast_ref::<SecurityAlert>() {
-                        hash_string(&alert.location)
-                    } else {
-                        0
-                    }
-                } else {
-                    0
-                }
+            Rc::new(|tuple: &dyn ZeroCopyFacts| {
+                tuple.first_fact()
+                    .and_then(|fact| fact.as_any().downcast_ref::<SecurityAlert>())
+                    .map_or(0, |alert| hash_string(&alert.location))
             }),
         )
         .penalize("transaction_in_alerted_location", |tuple: &AnyTuple| {
@@ -247,118 +216,53 @@ fn define_constraints(builder: &ConstraintBuilder<SimpleScore>) -> Vec<Constrain
         });
     recipes.push(constraint3);
 
-    // Constraint 4: Inactive customer transactions (matches Java exactly)
+    // Constraint 4: Inactive customer transactions
+    // Uses a chain of zero-copy filter and join.
     let constraint4 = builder
         .for_each::<Customer>()
-        .filter(Rc::new(|tuple: &AnyTuple| {
-            if let AnyTuple::Uni(uni_tuple) = tuple {
-                if let Some(customer) = uni_tuple.fact_a.as_any().downcast_ref::<Customer>() {
-                    matches!(customer.status, CustomerStatus::Inactive)
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
+        .filter_zero_copy(zero_copy_ops::field_check(|c: &Customer| {
+            matches!(c.status, CustomerStatus::Inactive)
         }))
-        .join(
+        .join_zero_copy(
             builder.for_each::<Transaction>(),
             JoinerType::Equal,
-            Rc::new(|tuple: &AnyTuple| {
-                if let AnyTuple::Uni(uni_tuple) = tuple {
-                    if let Some(customer) = uni_tuple.fact_a.as_any().downcast_ref::<Customer>() {
-                        customer.id as u64
-                    } else {
-                        0
-                    }
-                } else {
-                    0
-                }
-            }),
-            Rc::new(|tuple: &AnyTuple| {
-                if let AnyTuple::Uni(uni_tuple) = tuple {
-                    if let Some(tx) = uni_tuple.fact_a.as_any().downcast_ref::<Transaction>() {
-                        tx.customer_id as u64
-                    } else {
-                        0
-                    }
-                } else {
-                    0
-                }
-            }),
+            zero_copy_ops::field_key(|c: &Customer| c.id),
+            zero_copy_ops::field_key(|tx: &Transaction| tx.customer_id),
         )
         .penalize("inactive_customer_transaction", |_tuple: &AnyTuple| {
             SimpleScore::new(500.0)
         });
     recipes.push(constraint4);
 
-    // Constraint 5: High-risk transactions without alert (matches Java ifNotExists logic)
+    // Constraint 5: High-risk transactions without alert
+    // Uses a chain of zero-copy filter, join, and conditional join.
     let constraint5 = builder
         .for_each::<Customer>()
-        .filter(Rc::new(|tuple: &AnyTuple| {
-            if let AnyTuple::Uni(uni_tuple) = tuple {
-                if let Some(customer) = uni_tuple.fact_a.as_any().downcast_ref::<Customer>() {
-                    matches!(customer.risk_level, RiskLevel::High)
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
+        .filter_zero_copy(zero_copy_ops::field_check(|c: &Customer| {
+            matches!(c.risk_level, RiskLevel::High)
         }))
-        .join(
+        .join_zero_copy(
             builder.for_each::<Transaction>(),
             JoinerType::Equal,
-            Rc::new(|tuple: &AnyTuple| {
-                if let AnyTuple::Uni(uni_tuple) = tuple {
-                    if let Some(customer) = uni_tuple.fact_a.as_any().downcast_ref::<Customer>() {
-                        customer.id as u64
-                    } else {
-                        0
-                    }
-                } else {
-                    0
-                }
-            }),
-            Rc::new(|tuple: &AnyTuple| {
-                if let AnyTuple::Uni(uni_tuple) = tuple {
-                    if let Some(tx) = uni_tuple.fact_a.as_any().downcast_ref::<Transaction>() {
-                        tx.customer_id as u64
-                    } else {
-                        0
-                    }
-                } else {
-                    0
-                }
-            }),
+            zero_copy_ops::field_key(|c: &Customer| c.id),
+            zero_copy_ops::field_key(|tx: &Transaction| tx.customer_id),
         )
-        .if_not_exists(
+        .if_not_exists_zero_copy(
             builder.for_each::<SecurityAlert>(),
-            Rc::new(|tuple: &AnyTuple| {
-                if let AnyTuple::Bi(bi_tuple) = tuple {
-                    if let Some(tx) = bi_tuple.fact_b.as_any().downcast_ref::<Transaction>() {
-                        hash_string(&tx.location)
-                    } else {
-                        0
-                    }
-                } else {
-                    0
-                }
+            Rc::new(|tuple: &dyn ZeroCopyFacts| {
+                // Get Transaction from the (Customer, Transaction) tuple
+                tuple.get_fact_ref(1) 
+                    .and_then(|fact| fact.as_any().downcast_ref::<Transaction>())
+                    .map_or(0, |tx| hash_string(&tx.location))
             }),
-            Rc::new(|tuple: &AnyTuple| {
-                if let AnyTuple::Uni(uni_tuple) = tuple {
-                    if let Some(alert) = uni_tuple.fact_a.as_any().downcast_ref::<SecurityAlert>() {
-                        hash_string(&alert.location)
-                    } else {
-                        0
-                    }
-                } else {
-                    0
-                }
+            Rc::new(|tuple: &dyn ZeroCopyFacts| {
+                tuple.first_fact()
+                    .and_then(|fact| fact.as_any().downcast_ref::<SecurityAlert>())
+                    .map_or(0, |alert| hash_string(&alert.location))
             }),
         )
         .penalize("high_risk_transaction_without_alert", |_tuple: &AnyTuple| {
-            SimpleScore::new(1000.0) // Match Java penalty exactly
+            SimpleScore::new(1000.0)
         });
     recipes.push(constraint5);
 
@@ -379,7 +283,7 @@ fn generate_data(
     num_transactions: usize,
     num_locations: usize,
 ) -> (Vec<Customer>, Vec<Transaction>, Vec<SecurityAlert>) {
-    let mut rng = rng();
+    let mut rng = rand::thread_rng();
 
     // Generate locations
     let locations: Vec<String> = (0..num_locations)
@@ -390,12 +294,12 @@ fn generate_data(
     let customers: Vec<Customer> = (0..num_customers)
         .map(|i| Customer {
             id: i as i32,
-            risk_level: match rng.random_range(0..3) {
+            risk_level: match rng.gen_range(0..3) {
                 0 => RiskLevel::Low,
                 1 => RiskLevel::Medium,
                 _ => RiskLevel::High,
             },
-            status: if rng.random_bool(0.95) {
+            status: if rng.gen_bool(0.95) {
                 CustomerStatus::Active
             } else {
                 CustomerStatus::Inactive
@@ -407,9 +311,9 @@ fn generate_data(
     let transactions: Vec<Transaction> = (0..num_transactions)
         .map(|i| Transaction {
             id: i as i32,
-            customer_id: rng.random_range(0..num_customers) as i32,
-            amount: rng.random_range(100..50_000_000), // 1 cent to $500,000 in cents
-            location: locations[rng.random_range(0..locations.len())].clone(),
+            customer_id: rng.gen_range(0..num_customers) as i32,
+            amount: rng.gen_range(100..50_000_000), // 1 cent to $500,000 in cents
+            location: locations[rng.gen_range(0..locations.len())].clone(),
         })
         .collect();
 
@@ -420,7 +324,7 @@ fn generate_data(
         .into_iter()
         .map(|loc| SecurityAlert {
             location: loc.clone(),
-            severity: rng.random_range(1..=5),
+            severity: rng.gen_range(1..=5),
         })
         .collect();
 
@@ -430,11 +334,11 @@ fn generate_data(
 // --- Main Test Runner ---
 
 fn main() -> Result<()> {
-    println!("### Starting Rust Greynet Stress Test ###");
+    println!("### Starting Rust Greynet Stress Test (Zero-Copy API) ###");
 
     // Configuration
     const NUM_CUSTOMERS: usize = 10_000;
-    const NUM_TRANSACTIONS: usize = 10_000_000; // Reduced from Python for initial test
+    const NUM_TRANSACTIONS: usize = 10_000_000;
     const NUM_LOCATIONS: usize = 1_000;
 
     // 1. Setup Phase
@@ -495,20 +399,10 @@ fn main() -> Result<()> {
     println!("Inserting facts and processing rules...");
     let processing_start = Instant::now();
 
-    // Insert customers
-    for customer in customers {
-        session.insert(customer)?;
-    }
-
-    // Insert transactions  
-    for transaction in transactions {
-        session.insert(transaction)?;
-    }
-
-    // Insert alerts
-    for alert in alerts {
-        session.insert(alert)?;
-    }
+    // Insert data (using batch insertion for potential performance gain)
+    session.insert_batch(customers)?;
+    session.insert_batch(transactions)?;
+    session.insert_batch(alerts)?;
 
     // Flush all operations and get final score
     session.flush()?;
@@ -536,9 +430,9 @@ fn main() -> Result<()> {
     println!("| Total Facts Processed          | {:}         |", total_facts);
     println!("| Setup Time (Build Network)     | {:.4} s      |", setup_duration.as_secs_f64());
     println!("| Data Generation Time           | {:.4} s      |", data_gen_duration.as_secs_f64());
-    println!("| **Processing Time (Insert+Flush)** | **{:.4} s**      |", processing_duration.as_secs_f64());
+    println!("| **Processing Time (Insert+Flush)** | **{:.4} s** |", processing_duration.as_secs_f64());
     println!("| Total Time                     | {:.4} s      |", total_duration.as_secs_f64());
-    println!("| **Throughput**                 | **{:.2} facts/sec** |", facts_per_second);
+    println!("| **Throughput** | **{:.2} facts/sec** |", facts_per_second);
 
     println!("\n#### Memory Usage Summary");
     println!("| Metric                         | Value               |");

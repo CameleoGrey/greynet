@@ -1,11 +1,13 @@
 //uni_index.rs
 use super::arena::SafeTupleIndex;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::hash::Hash;
+use smallvec::SmallVec;
 
 #[derive(Debug)]
 pub struct UniIndex<K: Eq + Hash> {
-    map: HashMap<K, Vec<SafeTupleIndex>>,
+    map: HashMap<K, SmallVec<[SafeTupleIndex; 4]>>,
 }
 
 impl<K: Eq + Hash> UniIndex<K> {

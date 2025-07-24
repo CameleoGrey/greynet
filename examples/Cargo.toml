@@ -3,6 +3,7 @@
 resolver = "2"
 members = [
     "stress_1",
+    "stress_zero",
 ]
 
 [workspace.dependencies]
