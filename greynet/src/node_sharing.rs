@@ -1,4 +1,3 @@
-//node_sharing.rs
 use crate::arena::NodeId;
 use crate::stream_def::RetrievalId;
 use crate::score::Score;

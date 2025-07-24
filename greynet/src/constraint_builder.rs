@@ -9,13 +9,16 @@ use std::marker::PhantomData;
 use crate::stream_def::Arity2;
 use crate::JoinerType;
 use crate::AnyTuple;
+use crate::zero_copy_ops;
+use crate::streams_zero_copy::ZeroCopyJoinOps;
+use crate::streams_zero_copy::ZeroCopyStreamOps;
 
 /// High-level builder for constraint satisfaction problems with comprehensive error handling
 #[derive(Debug)]
 pub struct ConstraintBuilder<S: Score> {
-    factory: Rc<RefCell<ConstraintFactory<S>>>,
-    weights: Rc<RefCell<ConstraintWeights>>,
-    _phantom: PhantomData<S>,
+    pub factory: Rc<RefCell<ConstraintFactory<S>>>,
+    pub weights: Rc<RefCell<ConstraintWeights>>,
+    pub _phantom: PhantomData<S>,
 }
 
 impl<S: Score + 'static> ConstraintBuilder<S> {
@@ -62,21 +65,14 @@ impl<S: Score + 'static> ConstraintBuilder<S> {
         )
     }
 
-    #[inline]
-    pub fn constraint(&self, id: &str, weight: f64, recipe_fn: impl Fn() -> ConstraintRecipe<S>) -> &Self {
-        self.weights.borrow().set_weight(id.to_string(), weight);
-        let recipe = recipe_fn();
-        self.factory.borrow_mut().add_constraint_def(recipe);
-        self
-    }
-
-    // ADD SIMD configuration option
-    pub fn with_simd_optimization(mut self, enable: bool) -> Self {
-        // Could store this in a config struct if needed
+    /// Add SIMD configuration option
+    pub fn with_simd_optimization(self, enable: bool) -> Self {
+        // This could store configuration in the factory for SIMD optimization
+        // For now, we'll use this as a marker for SIMD-aware building
         self
     }
     
-    // MODIFY build method to use SIMD-optimized session
+    /// Enhanced build method that uses SIMD-optimized session
     pub fn build(self) -> Result<Session<S>> {
         let factory = Rc::try_unwrap(self.factory)
             .map_err(|_| crate::GreynetError::constraint_builder_error("ConstraintFactory has multiple owners"))?
@@ -98,6 +94,89 @@ impl<S: Score + 'static> ConstraintBuilder<S> {
         }
         
         Ok(session)
+    }
+
+    /// Fixed constraint method to return Self for proper chaining
+    #[inline]
+    pub fn constraint(mut self, id: &str, weight: f64, recipe_fn: impl Fn() -> ConstraintRecipe<S>) -> Self {
+        self.weights.borrow_mut().set_weight(id.to_string(), weight);
+        let recipe = recipe_fn();
+        self.factory.borrow_mut().add_constraint_def(recipe);
+        self
+    }
+
+    /// Fixed bulk_constraints method
+    pub fn bulk_constraints(
+        mut self,
+        constraints: Vec<(&str, f64, Box<dyn Fn() -> ConstraintRecipe<S>>)>,
+    ) -> Self {
+        for (id, weight, recipe_fn) in constraints {
+            self.weights.borrow_mut().set_weight(id.to_string(), weight);
+            let recipe = recipe_fn();
+            self.factory.borrow_mut().add_constraint_def(recipe);
+        }
+        self
+    }
+    
+    /// Alternative bulk_constraints with closure support
+    pub fn bulk_constraints_with_closures<F>(
+        mut self,
+        constraints: Vec<(&str, f64, F)>,
+    ) -> Self 
+    where
+        F: Fn() -> ConstraintRecipe<S> + Clone,
+    {
+        for (id, weight, recipe_fn) in constraints {
+            self.weights.borrow_mut().set_weight(id.to_string(), weight);
+            let recipe = recipe_fn();
+            self.factory.borrow_mut().add_constraint_def(recipe);
+        }
+        self
+    }
+    
+    /// Convenience method for creating filtered fact streams
+    pub fn filtered_facts<T: GreynetFact + 'static, F>(
+        &self, 
+        predicate: F
+    ) -> Stream<Arity1, S>
+    where
+        F: Fn(&T) -> bool + 'static,
+    {
+        use crate::streams_zero_copy::{ZeroCopyStreamOps, zero_copy_ops};
+        self.for_each::<T>()
+            .filter_zero_copy(zero_copy_ops::field_check(predicate))
+    }
+    
+    /// Convenience method for creating joined streams with field access
+    pub fn join_on_fields<T, U, F1, F2, K>(
+        &self,
+        left_field: F1,
+        right_field: F2,
+    ) -> Stream<Arity2, S>
+    where
+        T: GreynetFact + 'static,
+        U: GreynetFact + 'static,
+        F1: Fn(&T) -> K + 'static,
+        F2: Fn(&U) -> K + 'static,
+        K: std::hash::Hash + 'static,
+    {
+        use crate::streams_zero_copy::ZeroCopyJoinOps;
+        self.for_each::<T>()
+            .join_on_field(self.for_each::<U>(), left_field, right_field)
+    }
+    
+    /// Create a high-performance unique pairs stream
+    pub fn unique_pairs<T: GreynetFact + 'static>(&self) -> Stream<Arity2, S> {
+        use crate::streams_zero_copy::{ZeroCopyJoinOps, zero_copy_ops};
+        let stream1 = self.for_each::<T>();
+        let stream2 = self.for_each::<T>();
+        
+        stream1.join_zero_copy(
+            stream2,
+            JoinerType::LessThan,
+            zero_copy_ops::first_fact_hash(),
+            zero_copy_ops::first_fact_hash(),
+        )
     }
 }
 

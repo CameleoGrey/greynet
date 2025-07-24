@@ -171,6 +171,66 @@ impl TupleArena {
         }
     }
 
+    #[cfg(debug_assertions)]
+    pub fn check_for_leaks(&self) -> Result<()> {
+        let mut live_count = 0;
+        let mut dead_count = 0;
+        let mut dying_count = 0;
+
+        for (_, tuple) in self.arena.iter() {
+            match tuple.state() {
+                TupleState::Dead => dead_count += 1,
+                TupleState::Dying => dying_count += 1,
+                _ => live_count += 1,
+            }
+        }
+
+        let pooled_count: usize = self.type_pools.values().map(|v| v.len()).sum();
+
+        if dying_count > 0 {
+            return Err(GreynetError::consistency_violation(format!(
+                "Found {} tuples in Dying state",
+                dying_count
+            )));
+        }
+
+        if dead_count != pooled_count {
+            return Err(GreynetError::consistency_violation(format!(
+                "Inconsistency: {} dead vs {} pooled",
+                dead_count, pooled_count
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Get current memory usage estimate
+    pub fn memory_usage_estimate(&self) -> usize {
+        self.limits.estimate_memory_usage(self.arena.len(), 0)
+    }
+
+    /// Get statistics about the arena
+    pub fn stats(&self) -> ArenaStats {
+        let mut live_count = 0;
+        let mut dead_count = 0;
+
+        for (_, tuple) in self.arena.iter() {
+            match tuple.state() {
+                TupleState::Dead => dead_count += 1,
+                _ => live_count += 1,
+            }
+        }
+
+        ArenaStats {
+            total_slots: self.arena.len(),
+            live_tuples: live_count,
+            dead_tuples: dead_count,
+            pooled_tuples: self.type_pools.values().map(|v| v.len()).sum(),
+            generation_counter: self.generation_counter,
+        }
+    }
+
+    /// Enhanced cleanup with SIMD optimization
     pub fn cleanup_dying_tuples(&mut self) -> usize {
         // Use SIMD version if available, fallback to original if not
         if cfg!(feature = "simd") {
@@ -180,6 +240,7 @@ impl TupleArena {
         }
     }
 
+    /// Scalar implementation for cleanup
     pub fn cleanup_dying_tuples_scalar(&mut self) -> usize {
         let mut cleaned_count = 0;
         let mut indices_to_clean = Vec::new();
@@ -201,6 +262,7 @@ impl TupleArena {
         cleaned_count
     }
 
+    /// SIMD-optimized cleanup
     pub fn cleanup_dying_tuples_simd(&mut self) -> usize {
         let mut states: Vec<TupleState> = Vec::with_capacity(self.arena.len());
         let mut indices: Vec<(generational_arena::Index, u64)> = Vec::with_capacity(self.arena.len());
@@ -263,62 +325,49 @@ impl TupleArena {
         updated_count
     }
 
-    #[cfg(debug_assertions)]
-    pub fn check_for_leaks(&self) -> Result<()> {
-        let mut live_count = 0;
-        let mut dead_count = 0;
-        let mut dying_count = 0;
-
+    /// Bulk tuple state analysis with SIMD
+    pub fn analyze_tuple_states(&self) -> HashMap<TupleState, usize> {
+        let mut states: Vec<TupleState> = Vec::with_capacity(self.arena.len());
+        
         for (_, tuple) in self.arena.iter() {
-            match tuple.state() {
-                TupleState::Dead => dead_count += 1,
-                TupleState::Dying => dying_count += 1,
-                _ => live_count += 1,
+            states.push(tuple.state());
+        }
+        
+        let mut counts = HashMap::default();
+        
+        if cfg!(feature = "simd") && states.len() > 64 {
+            // Use SIMD for large datasets
+            counts.insert(TupleState::Creating, SimdOps::count_matching_tuples_simd(&states, TupleState::Creating));
+            counts.insert(TupleState::Ok, SimdOps::count_matching_tuples_simd(&states, TupleState::Ok));
+            counts.insert(TupleState::Updating, SimdOps::count_matching_tuples_simd(&states, TupleState::Updating));
+            counts.insert(TupleState::Dying, SimdOps::count_matching_tuples_simd(&states, TupleState::Dying));
+            counts.insert(TupleState::Aborting, SimdOps::count_matching_tuples_simd(&states, TupleState::Aborting));
+            counts.insert(TupleState::Dead, SimdOps::count_matching_tuples_simd(&states, TupleState::Dead));
+        } else {
+            // Fallback to scalar counting
+            for &state in &states {
+                *counts.entry(state).or_insert(0) += 1;
             }
         }
-
-        let pooled_count: usize = self.type_pools.values().map(|v| v.len()).sum();
-
-        if dying_count > 0 {
-            return Err(GreynetError::consistency_violation(format!(
-                "Found {} tuples in Dying state",
-                dying_count
-            )));
-        }
-
-        if dead_count != pooled_count {
-            return Err(GreynetError::consistency_violation(format!(
-                "Inconsistency: {} dead vs {} pooled",
-                dead_count, pooled_count
-            )));
-        }
-
-        Ok(())
+        
+        counts
     }
 
-    /// Get current memory usage estimate
-    pub fn memory_usage_estimate(&self) -> usize {
-        self.limits.estimate_memory_usage(self.arena.len(), 0)
+    /// Pre-allocate tuple slots for bulk operations
+    pub fn reserve_capacity(&mut self, additional: usize) {
+        self.arena.reserve(additional);
+        self.active_generations.dense.reserve(additional);
     }
 
-    /// Get statistics about the arena
-    pub fn stats(&self) -> ArenaStats {
-        let mut live_count = 0;
-        let mut dead_count = 0;
-
-        for (_, tuple) in self.arena.iter() {
-            match tuple.state() {
-                TupleState::Dead => dead_count += 1,
-                _ => live_count += 1,
-            }
-        }
-
-        ArenaStats {
-            total_slots: self.arena.len(),
-            live_tuples: live_count,
-            dead_tuples: dead_count,
-            pooled_tuples: self.type_pools.values().map(|v| v.len()).sum(),
-            generation_counter: self.generation_counter,
+    /// Estimate memory pressure and trigger cleanup if needed
+    pub fn cleanup_if_memory_pressure(&mut self) -> usize {
+        let memory_estimate = self.memory_usage_estimate();
+        
+        if memory_estimate > self.limits.max_memory_mb / 2 {
+            // High memory pressure - aggressive cleanup
+            self.cleanup_dying_tuples()
+        } else {
+            0
         }
     }
 }

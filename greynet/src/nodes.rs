@@ -1,4 +1,3 @@
-// nodes.rs
 use super::advanced_index::AdvancedIndex;
 use super::arena::{NodeId, NodeOperation, SafeTupleIndex, TupleArena};
 use super::collectors::{BaseCollector, UndoFunction};
@@ -10,7 +9,7 @@ use crate::constraint::ConstraintWeights;
 use crate::packed_indices::PackedIndices;
 use crate::score::Score;
 use crate::state::TupleState;
-use crate::tuple::{AnyTuple, FactIterator};
+use crate::tuple::{AnyTuple, FactIterator, ZeroCopyFacts};
 use crate::{GreynetError, Result};
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
@@ -18,14 +17,58 @@ use std::any::TypeId;
 use std::cell::RefCell;
 use std::rc::Rc;
 use crate::SimdOps;
-use crate::tuple::ZeroCopyFacts;
 
+// --- Function Types ---
+
+// Traditional (old API) function types
 pub type SharedImpactFn<S> = Rc<dyn Fn(&AnyTuple) -> S>;
 pub type SharedKeyFn = Rc<dyn Fn(&AnyTuple) -> u64>;
 pub type SharedPredicate = Rc<dyn Fn(&AnyTuple) -> bool>;
 pub type SharedMapperFn = Rc<dyn Fn(&AnyTuple) -> Vec<Rc<dyn crate::fact::GreynetFact>>>;
+
+// Zero-Copy (new API) function types
 pub type ZeroCopyKeyFn = Rc<dyn Fn(&dyn ZeroCopyFacts) -> u64>;
 pub type ZeroCopyPredicate = Rc<dyn Fn(&dyn ZeroCopyFacts) -> bool>;
+
+// --- ENUM WRAPPERS FOR TRUE ZERO-COPY PATH ---
+// These enums allow nodes to hold either a traditional or a zero-copy function,
+// enabling a true fast path for the new API.
+
+#[derive(Clone)]
+pub enum Predicate {
+    Traditional(SharedPredicate),
+    ZeroCopy(ZeroCopyPredicate),
+}
+
+impl Predicate {
+    #[inline]
+    fn execute(&self, tuple: &AnyTuple) -> bool {
+        match self {
+            Predicate::Traditional(p) => p(tuple),
+            // AnyTuple implements ZeroCopyFacts, so we can pass it directly.
+            // This avoids creating a new closure and leverages the trait directly.
+            Predicate::ZeroCopy(p) => p(tuple),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub enum KeyFn {
+    Traditional(SharedKeyFn),
+    ZeroCopy(ZeroCopyKeyFn),
+}
+
+impl KeyFn {
+    #[inline]
+    fn execute(&self, tuple: &AnyTuple) -> u64 {
+        match self {
+            KeyFn::Traditional(k) => k(tuple),
+            KeyFn::ZeroCopy(k) => k(tuple),
+        }
+    }
+}
+
+// --- Node Definitions (Updated) ---
 
 #[derive(Debug)]
 pub struct FromNode {
@@ -70,11 +113,11 @@ impl FromNode {
 
 pub struct FilterNode {
     pub children: Vec<NodeId>,
-    pub predicate: SharedPredicate,
+    pub predicate: Predicate, // UPDATED
 }
 
 impl FilterNode {
-    pub fn new(predicate: SharedPredicate) -> Self {
+    pub fn new(predicate: Predicate) -> Self {
         Self {
             children: Vec::new(),
             predicate,
@@ -89,21 +132,10 @@ impl FilterNode {
         operations: &mut Vec<NodeOperation>,
     ) -> Result<()> {
         if let Ok(tuple) = tuples.get_tuple_checked(tuple_index) {
-            // Use the stored predicate, not a parameter
-            if (self.predicate)(tuple) {
-                // Unrolled loop for common child counts
-                match self.children.len() {
-                    0 => {},
-                    1 => operations.push(NodeOperation::Insert(self.children[0], tuple_index)),
-                    2 => {
-                        operations.push(NodeOperation::Insert(self.children[0], tuple_index));
-                        operations.push(NodeOperation::Insert(self.children[1], tuple_index));
-                    }
-                    _ => {
-                        for &child_id in &self.children {
-                            operations.push(NodeOperation::Insert(child_id, tuple_index));
-                        }
-                    }
+            // UPDATED: Execute the predicate using the enum wrapper
+            if self.predicate.execute(tuple) {
+                for &child_id in &self.children {
+                    operations.push(NodeOperation::Insert(child_id, tuple_index));
                 }
             }
         }
@@ -118,7 +150,8 @@ impl FilterNode {
         operations: &mut Vec<NodeOperation>,
     ) -> Result<()> {
         if let Ok(tuple) = tuples.get_tuple_checked(tuple_index) {
-            if (self.predicate)(tuple) {
+            // UPDATED: Execute the predicate using the enum wrapper
+            if self.predicate.execute(tuple) {
                 for &child_id in &self.children {
                     operations.push(NodeOperation::Retract(child_id, tuple_index));
                 }
@@ -181,16 +214,16 @@ pub struct JoinNode {
     pub joiner_type: JoinerType,
     pub left_index: JoinIndex,
     pub right_index: JoinIndex,
-    pub left_key_fn: SharedKeyFn,
-    pub right_key_fn: SharedKeyFn,
+    pub left_key_fn: KeyFn, // UPDATED
+    pub right_key_fn: KeyFn, // UPDATED
     pub beta_memory: HashMap<PackedIndices, SafeTupleIndex>,
 }
 
 impl JoinNode {
     pub fn new(
         joiner_type: JoinerType,
-        left_key_fn: SharedKeyFn,
-        right_key_fn: SharedKeyFn,
+        left_key_fn: KeyFn,
+        right_key_fn: KeyFn,
     ) -> Self {
         Self {
             children: Vec::new(),
@@ -211,8 +244,8 @@ impl JoinNode {
     ) -> Result<()> {
         let left_tuple = tuples.get_tuple_checked(tuple_index)?.clone();
     
-        // Use the stored left_key_fn
-        let key = (self.left_key_fn)(&left_tuple);
+        // UPDATED: Execute key function via enum wrapper
+        let key = self.left_key_fn.execute(&left_tuple);
         self.left_index.put(key, tuple_index);
     
         let right_matches: SmallVec<[SafeTupleIndex; 8]> = self
@@ -222,31 +255,16 @@ impl JoinNode {
             .copied()
             .collect();
     
-        // Optimized batch operations
         if !right_matches.is_empty() {
             operations.reserve(right_matches.len() * self.children.len());
-            
             for &right_match_idx in &right_matches {
                 let right_tuple = tuples.get_tuple_checked(right_match_idx)?.clone();
-    
                 if let Ok(combined) = left_tuple.combine(&right_tuple) {
                     let child_idx = tuples.acquire_tuple_fast(combined)?;
                     let packed = crate::packed_indices::PackedIndices::new(tuple_index, right_match_idx);
                     self.beta_memory.insert(packed, child_idx);
-    
-                    // Unrolled loop for common cases
-                    match self.children.len() {
-                        0 => {},
-                        1 => operations.push(NodeOperation::Insert(self.children[0], child_idx)),
-                        2 => {
-                            operations.push(NodeOperation::Insert(self.children[0], child_idx));
-                            operations.push(NodeOperation::Insert(self.children[1], child_idx));
-                        }
-                        _ => {
-                            for &child_id in &self.children {
-                                operations.push(NodeOperation::Insert(child_id, child_idx));
-                            }
-                        }
+                    for &child_id in &self.children {
+                        operations.push(NodeOperation::Insert(child_id, child_idx));
                     }
                 }
             }
@@ -262,7 +280,8 @@ impl JoinNode {
     ) -> Result<()> {
         let right_tuple = tuples.get_tuple_checked(tuple_index)?.clone();
 
-        let key = (self.right_key_fn)(&right_tuple);
+        // UPDATED: Execute key function via enum wrapper
+        let key = self.right_key_fn.execute(&right_tuple);
         self.right_index.put(key, tuple_index);
 
         let left_matches: SmallVec<[SafeTupleIndex; 8]> = self
@@ -272,29 +291,18 @@ impl JoinNode {
             .copied()
             .collect();
 
-        if !left_matches.is_empty() && self.children.len() > 1 {
+        if !left_matches.is_empty() {
             operations.reserve(left_matches.len() * self.children.len());
         }
 
         for &left_match_idx in &left_matches {
             let left_tuple = tuples.get_tuple_checked(left_match_idx)?.clone();
-
             if let Ok(combined) = left_tuple.combine(&right_tuple) {
                 let child_idx = tuples.acquire_tuple_fast(combined)?;
                 let packed = PackedIndices::new(left_match_idx, tuple_index);
                 self.beta_memory.insert(packed, child_idx);
-
-                match self.children.len() {
-                    1 => operations.push(NodeOperation::Insert(self.children[0], child_idx)),
-                    2 => {
-                        operations.push(NodeOperation::Insert(self.children[0], child_idx));
-                        operations.push(NodeOperation::Insert(self.children[1], child_idx));
-                    }
-                    _ => {
-                        for &child_id in &self.children {
-                            operations.push(NodeOperation::Insert(child_id, child_idx));
-                        }
-                    }
+                for &child_id in &self.children {
+                    operations.push(NodeOperation::Insert(child_id, child_idx));
                 }
             }
         }
@@ -308,7 +316,8 @@ impl JoinNode {
         operations: &mut Vec<NodeOperation>,
     ) -> Result<()> {
         if let Ok(tuple) = tuples.get_tuple_checked(tuple_index) {
-            let key = (self.left_key_fn)(tuple);
+            // UPDATED: Execute key function via enum wrapper
+            let key = self.left_key_fn.execute(tuple);
             self.left_index.remove(key, &tuple_index);
         }
 
@@ -327,11 +336,9 @@ impl JoinNode {
                 for &child_id in &self.children {
                     operations.push(NodeOperation::Retract(child_id, child_idx));
                 }
-
                 if let Ok(child_tuple) = tuples.get_tuple_mut_checked(child_idx) {
                     child_tuple.set_state(TupleState::Dying);
                 }
-
                 operations.push(NodeOperation::ReleaseTuple(child_idx));
             }
         }
@@ -345,7 +352,8 @@ impl JoinNode {
         operations: &mut Vec<NodeOperation>,
     ) -> Result<()> {
         if let Ok(tuple) = tuples.get_tuple_checked(tuple_index) {
-            let key = (self.right_key_fn)(tuple);
+            // UPDATED: Execute key function via enum wrapper
+            let key = self.right_key_fn.execute(tuple);
             self.right_index.remove(key, &tuple_index);
         }
 
@@ -364,11 +372,9 @@ impl JoinNode {
                 for &child_id in &self.children {
                     operations.push(NodeOperation::Retract(child_id, child_idx));
                 }
-
                 if let Ok(child_tuple) = tuples.get_tuple_mut_checked(child_idx) {
                     child_tuple.set_state(TupleState::Dying);
                 }
-
                 operations.push(NodeOperation::ReleaseTuple(child_idx));
             }
         }
@@ -393,16 +399,16 @@ pub struct ConditionalNode {
     should_exist: bool,
     left_index: UniIndex<u64>,
     right_index: UniIndex<u64>,
-    left_key_fn: SharedKeyFn,
-    right_key_fn: SharedKeyFn,
+    left_key_fn: KeyFn, // UPDATED
+    right_key_fn: KeyFn, // UPDATED
     propagation_map: HashMap<SafeTupleIndex, u64>,
 }
 
 impl ConditionalNode {
     pub fn new(
         should_exist: bool,
-        left_key_fn: SharedKeyFn,
-        right_key_fn: SharedKeyFn,
+        left_key_fn: KeyFn,
+        right_key_fn: KeyFn,
     ) -> Self {
         Self {
             children: Vec::new(),
@@ -422,7 +428,8 @@ impl ConditionalNode {
         operations: &mut Vec<NodeOperation>,
     ) -> Result<()> {
         let key = if let Ok(tuple) = tuples.get_tuple_checked(tuple_index) {
-            (self.left_key_fn)(tuple)
+            // UPDATED: Execute key function via enum wrapper
+            self.left_key_fn.execute(tuple)
         } else {
             return Ok(());
         };
@@ -440,6 +447,8 @@ impl ConditionalNode {
         Ok(())
     }
 
+    // ... other methods in ConditionalNode need similar updates for key_fn execution ...
+    // (Omitted for brevity, but the pattern is the same as above)
     pub fn insert_right_collect_ops(
         &mut self,
         tuple_index: SafeTupleIndex,
@@ -447,7 +456,7 @@ impl ConditionalNode {
         operations: &mut Vec<NodeOperation>,
     ) -> Result<()> {
         let key = if let Ok(tuple) = tuples.get_tuple_checked(tuple_index) {
-            (self.right_key_fn)(tuple)
+            self.right_key_fn.execute(tuple)
         } else {
             return Ok(());
         };
@@ -481,7 +490,7 @@ impl ConditionalNode {
         operations: &mut Vec<NodeOperation>,
     ) -> Result<()> {
         let key = if let Ok(tuple) = tuples.get_tuple_checked(tuple_index) {
-            (self.left_key_fn)(tuple)
+            self.left_key_fn.execute(tuple)
         } else {
             return Ok(());
         };
@@ -505,7 +514,7 @@ impl ConditionalNode {
         operations: &mut Vec<NodeOperation>,
     ) -> Result<()> {
         let key = if let Ok(tuple) = tuples.get_tuple_checked(tuple_index) {
-            (self.right_key_fn)(tuple)
+            self.right_key_fn.execute(tuple)
         } else {
             return Ok(());
         };
@@ -534,6 +543,7 @@ impl ConditionalNode {
     }
 }
 
+
 impl std::fmt::Debug for ConditionalNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConditionalNode")
@@ -548,7 +558,7 @@ impl std::fmt::Debug for ConditionalNode {
 
 pub struct GroupNode {
     pub children: Vec<NodeId>,
-    key_fn: SharedKeyFn,
+    key_fn: KeyFn, // UPDATED
     collector_supplier: CollectorSupplier,
     groups: HashMap<u64, Box<dyn BaseCollector>>,
     tuple_to_undo: HashMap<SafeTupleIndex, (u64, UndoFunction)>,
@@ -556,7 +566,7 @@ pub struct GroupNode {
 }
 
 impl GroupNode {
-    pub fn new(key_fn: SharedKeyFn, collector_supplier: CollectorSupplier) -> Self {
+    pub fn new(key_fn: KeyFn, collector_supplier: CollectorSupplier) -> Self {
         Self {
             children: Vec::new(),
             key_fn,
@@ -574,7 +584,8 @@ impl GroupNode {
         operations: &mut Vec<NodeOperation>,
     ) -> Result<()> {
         let parent_tuple = tuples.get_tuple_checked(tuple_index)?;
-        let key = (self.key_fn)(parent_tuple);
+        // UPDATED: Execute key function via enum wrapper
+        let key = self.key_fn.execute(parent_tuple);
 
         let collector = self
             .groups
@@ -586,6 +597,7 @@ impl GroupNode {
         Ok(())
     }
 
+    // ... other methods in GroupNode are unchanged but rely on the updated key_fn ...
     pub fn retract_collect_ops(
         &mut self,
         tuple_index: SafeTupleIndex,
@@ -668,6 +680,7 @@ impl GroupNode {
     }
 }
 
+
 impl std::fmt::Debug for GroupNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GroupNode")
@@ -679,6 +692,9 @@ impl std::fmt::Debug for GroupNode {
     }
 }
 
+// FlatMapNode and ScoringNode remain largely the same as they don't use
+// the predicate/key function pattern in the same way.
+// ... (FlatMapNode, ScoringNode, etc. are omitted for brevity) ...
 pub struct FlatMapNode {
     pub children: Vec<NodeId>,
     mapper_fn: SharedMapperFn,

@@ -173,6 +173,69 @@ impl<S: Score + 'static> Session<S> {
         Ok(all_matches)
     }
 
+    pub fn retract_batch<'a, T: GreynetFact + 'a>(
+        &mut self,
+        facts: impl IntoIterator<Item = &'a T>,
+    ) -> Result<()> {
+        for fact in facts {
+            self.retract(fact)?;
+        }
+        Ok(())
+    }
+
+    pub fn validate_consistency(&self) -> Result<()> {
+        let map_count = self.fact_to_tuple_map.len();
+        let mut arena_live_count = 0;
+
+        for (_, tuple) in self.tuples.arena.iter() {
+            if !matches!(tuple.state(), TupleState::Dead) {
+                arena_live_count += 1;
+            }
+        }
+
+        if map_count != arena_live_count {
+            return Err(GreynetError::consistency_violation(
+                format!("Fact map contains {} facts, but arena has {} live tuples", 
+                       map_count, arena_live_count)
+            ));
+        }
+
+        // Additional consistency checks
+        #[cfg(debug_assertions)]
+        self.tuples.check_for_leaks()?;
+
+        Ok(())
+    }
+    
+    /// Get comprehensive session statistics
+    pub fn get_statistics(&self) -> SessionStatistics {
+        let arena_stats = self.tuples.stats();
+        
+        SessionStatistics {
+            total_facts: self.fact_to_tuple_map.len(),
+            total_nodes: self.nodes.len(),
+            scoring_nodes: self.scoring_nodes.len(),
+            arena_stats,
+            memory_usage_mb: self.tuples.memory_usage_estimate(),
+        }
+    }
+    
+    /// Check if session is within resource limits
+    pub fn check_resource_limits(&self) -> Result<()> {
+        self.limits.check_tuple_limit(self.tuples.arena.len())?;
+        
+        let memory_usage = self.tuples.memory_usage_estimate();
+        if memory_usage > self.limits.max_memory_mb {
+            return Err(GreynetError::resource_limit(
+                "memory",
+                format!("Current: {}MB, Limit: {}MB", memory_usage, self.limits.max_memory_mb)
+            ));
+        }
+        
+        Ok(())
+    }
+
+    /// SIMD-optimized batch insertion for better performance
     pub fn insert_batch_simd<T: GreynetFact + 'static>(
         &mut self,
         facts: impl IntoIterator<Item = T>,
@@ -234,7 +297,7 @@ impl<S: Score + 'static> Session<S> {
         Ok(())
     }
 
-    // REPLACE existing insert_batch to use SIMD version
+    /// Enhanced insert_batch that automatically uses SIMD when available
     pub fn insert_batch<T: GreynetFact + 'static>(
         &mut self,
         facts: impl IntoIterator<Item = T>,
@@ -250,7 +313,7 @@ impl<S: Score + 'static> Session<S> {
         }
     }
 
-    // REPLACE get_score to use SIMD aggregation
+    /// SIMD-optimized score calculation
     pub fn get_score(&mut self) -> Result<S> {
         self.flush()?;
 
@@ -282,66 +345,14 @@ impl<S: Score + 'static> Session<S> {
         }
     }
 
-    pub fn retract_batch<'a, T: GreynetFact + 'a>(
-        &mut self,
-        facts: impl IntoIterator<Item = &'a T>,
-    ) -> Result<()> {
-        for fact in facts {
-            self.retract(fact)?;
-        }
-        Ok(())
+    /// Bulk state transition using SIMD optimization
+    pub fn bulk_transition_tuple_states(&mut self, from: TupleState, to: TupleState) -> Result<usize> {
+        Ok(self.tuples.bulk_transition_states(from, to))
     }
 
-    pub fn validate_consistency(&self) -> Result<()> {
-        let map_count = self.fact_to_tuple_map.len();
-        let mut arena_live_count = 0;
-
-        for (_, tuple) in self.tuples.arena.iter() {
-            if !matches!(tuple.state(), TupleState::Dead) {
-                arena_live_count += 1;
-            }
-        }
-
-        if map_count != arena_live_count {
-            return Err(GreynetError::consistency_violation(
-                format!("Fact map contains {} facts, but arena has {} live tuples", 
-                       map_count, arena_live_count)
-            ));
-        }
-
-        // Additional consistency checks
-        #[cfg(debug_assertions)]
-        self.tuples.check_for_leaks()?;
-
-        Ok(())
-    }
-    
-    /// Get comprehensive session statistics
-    pub fn get_statistics(&self) -> SessionStatistics {
-        let arena_stats = self.tuples.stats();
-        
-        SessionStatistics {
-            total_facts: self.fact_to_tuple_map.len(),
-            total_nodes: self.nodes.len(),
-            scoring_nodes: self.scoring_nodes.len(),
-            arena_stats,
-            memory_usage_mb: self.tuples.memory_usage_estimate(),
-        }
-    }
-    
-    /// Check if session is within resource limits
-    pub fn check_resource_limits(&self) -> Result<()> {
-        self.limits.check_tuple_limit(self.tuples.arena.len())?;
-        
-        let memory_usage = self.tuples.memory_usage_estimate();
-        if memory_usage > self.limits.max_memory_mb {
-            return Err(GreynetError::resource_limit(
-                "memory",
-                format!("Current: {}MB, Limit: {}MB", memory_usage, self.limits.max_memory_mb)
-            ));
-        }
-        
-        Ok(())
+    /// Enhanced cleanup using SIMD optimization
+    pub fn cleanup_dying_tuples(&mut self) -> Result<usize> {
+        Ok(self.tuples.cleanup_dying_tuples())
     }
 }
 
