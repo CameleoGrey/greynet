@@ -9,7 +9,6 @@ pub mod arena;
 pub mod collectors;
 pub mod constraint;
 pub mod constraint_builder;
-pub mod ergonomic_builders;
 pub mod error;
 pub mod fact;
 pub mod fact_impls;
@@ -30,7 +29,6 @@ pub mod uni_index;
 pub mod utils;
 pub mod sparse_set;
 pub mod packed_indices;
-pub mod simd_ops;
 pub mod common_ops;
 pub mod streams_zero_copy;
 
@@ -50,7 +48,6 @@ pub use constraint::ConstraintWeights;
 pub use stream_def::{Stream, Arity1, Arity2, Arity3, Arity4, Arity5, ConstraintRecipe};
 pub use collectors::{BaseCollector, Collectors};
 pub use analysis::{ConstraintAnalysis, ConstraintViolationReport, NetworkStatistics};
-pub use simd_ops::SimdOps;
 
 /// Memory leak detection macro for debug builds
 #[macro_export]
@@ -114,11 +111,6 @@ pub fn builder_with_limits<S: Score + 'static>(limits: ResourceLimits) -> Constr
     ConstraintBuilder::with_limits(limits)
 }
 
-// Add to the main exports - FIXED: Added missing exports
-pub use crate::streams_zero_copy::{
-    ZeroCopyJoinOps, ZeroCopyStreamOps, zero_copy_ops,
-    ZeroCopyKeyFn, ZeroCopyPredicate, ZeroCopyMapperFn, ZeroCopyStreamBuilder
-};
 
 /// Performance-optimized prelude for common imports
 pub mod prelude {
@@ -129,17 +121,8 @@ pub mod prelude {
         Result, GreynetError, ResourceLimits, ConstraintRecipe
     };
     
-    // Zero-copy API exports
-    pub use crate::streams_zero_copy::{
-        ZeroCopyJoinOps, ZeroCopyStreamOps, zero_copy_ops,
-        ZeroCopyKeyFn, ZeroCopyPredicate, ZeroCopyStreamBuilder
-    };
-    
     // Tuple zero-copy traits
     pub use crate::tuple::ZeroCopyFacts;
-    
-    // SIMD operations
-    pub use crate::SimdOps;
     
     pub use std::rc::Rc;
 }
@@ -147,10 +130,10 @@ pub mod prelude {
 // Enhanced convenience functions
 /// Create a zero-copy optimized constraint builder
 pub fn zero_copy_builder<S: Score + 'static>() -> ConstraintBuilder<S> {
-    ConstraintBuilder::new().with_simd_optimization(true)
+    ConstraintBuilder::new()
 }
 
 /// Create a zero-copy optimized constraint builder with custom limits
 pub fn zero_copy_builder_with_limits<S: Score + 'static>(limits: ResourceLimits) -> ConstraintBuilder<S> {
-    ConstraintBuilder::with_limits(limits).with_simd_optimization(true)
+    ConstraintBuilder::with_limits(limits)
 }

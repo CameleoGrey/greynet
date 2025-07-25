@@ -4,6 +4,7 @@ use super::factory::ConstraintFactory;
 use super::joiner::JoinerType;
 use super::nodes::{SharedKeyFn, SharedPredicate, SharedImpactFn, SharedMapperFn};
 use super::collectors::BaseCollector;
+use crate::nodes::ImpactFn;
 use crate::{GreynetFact, Score, AnyTuple};
 use std::any::TypeId;
 use std::cell::RefCell;
@@ -25,7 +26,7 @@ pub struct Arity5;
 #[derive(Clone)]
 pub struct ConstraintRecipe<S: Score> {
     pub stream_def: StreamDefinition<S>,
-    pub penalty_function: SharedImpactFn<S>,
+    pub penalty_function: crate::nodes::ImpactFn<S>, // UPDATED: Use wrapper enum
     pub constraint_id: String,
 }
 
@@ -105,9 +106,10 @@ impl FunctionId {
     }
 }
 
-#[derive(Clone, Debug)]  // Remove Hash, PartialEq, Eq
+// Fixed RetrievalId with proper trait bounds
+#[derive(Clone, Debug)]
 pub enum RetrievalId<S: Score> {
-    From(TypeId, std::marker::PhantomData<S>),
+    From(TypeId, PhantomData<S>),
     Filter {
         source: Box<RetrievalId<S>>,
         predicate_id: FunctionId,
@@ -135,9 +137,14 @@ pub enum RetrievalId<S: Score> {
         source: Box<RetrievalId<S>>,
         mapper_fn_id: usize,
     },
+    Scoring {
+        source: Box<RetrievalId<S>>,
+        impact_fn_id: FunctionId,
+        constraint_id: String,
+    },
 }
 
-// Add manual implementations that ignore PhantomData
+// Manual implementation of PartialEq that ignores PhantomData
 impl<S: Score> PartialEq for RetrievalId<S> {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -160,6 +167,10 @@ impl<S: Score> PartialEq for RetrievalId<S> {
              RetrievalId::FlatMap { source: c, mapper_fn_id: d }) => {
                 a == c && b == d
             },
+            (RetrievalId::Scoring { source: a, impact_fn_id: b, constraint_id: c },
+             RetrievalId::Scoring { source: d, impact_fn_id: e, constraint_id: f }) => {
+                a == d && b == e && c == f
+            },
             _ => false,
         }
     }
@@ -167,6 +178,7 @@ impl<S: Score> PartialEq for RetrievalId<S> {
 
 impl<S: Score> Eq for RetrievalId<S> {}
 
+// Manual implementation of Hash that ignores PhantomData
 impl<S: Score> std::hash::Hash for RetrievalId<S> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         match self {
@@ -206,11 +218,15 @@ impl<S: Score> std::hash::Hash for RetrievalId<S> {
                 source.hash(state);
                 mapper_fn_id.hash(state);
             },
+            RetrievalId::Scoring { source, impact_fn_id, constraint_id } => {
+                6u8.hash(state);
+                source.hash(state);
+                impact_fn_id.hash(state);
+                constraint_id.hash(state);
+            },
         }
     }
 }
-
-// NOTE: greynet is a single-threaded library - no thread safety needed
 
 #[derive(Clone)]
 pub enum StreamDefinition<S: Score> {
@@ -220,6 +236,7 @@ pub enum StreamDefinition<S: Score> {
     ConditionalJoin(ConditionalJoinDefinition<S>),
     Group(GroupDefinition<S>),
     FlatMap(FlatMapDefinition<S>),
+    Scoring(ScoringDefinition<S>), // NEW: Add scoring definition
 }
 
 impl<S: Score> StreamDefinition<S> {
@@ -251,7 +268,12 @@ impl<S: Score> StreamDefinition<S> {
             },
             StreamDefinition::FlatMap(def) => RetrievalId::FlatMap {
                 source: Box::new(def.source.get_retrieval_id()),
-                mapper_fn_id: def.mapper_fn_id,
+                mapper_fn_id: def.mapper_fn_id.id(), // UPDATED: Use .id() method
+            },
+            StreamDefinition::Scoring(def) => RetrievalId::Scoring { // NEW: Add scoring retrieval
+                source: Box::new(def.source.get_retrieval_id()),
+                impact_fn_id: def.impact_fn_id.clone(),
+                constraint_id: def.constraint_id.clone(),
             },
         }
     }
@@ -267,9 +289,9 @@ impl<S: Score> StreamDefinition<S> {
             StreamDefinition::ConditionalJoin(def) => def.source.output_arity(),
             StreamDefinition::Group(_) => 2,
             StreamDefinition::FlatMap(_) => 1,
+            StreamDefinition::Scoring(def) => def.source.output_arity(), // NEW: Scoring doesn't change arity
         }
     }
-    
 }
 
 #[derive(Debug, Clone)]
@@ -386,14 +408,37 @@ impl<S: Score> GroupDefinition<S> {
 }
 
 #[derive(Clone)]
+pub struct ScoringDefinition<S: Score> {
+    pub source: Box<StreamDefinition<S>>,
+    pub impact_fn_id: FunctionId,
+    pub constraint_id: String,
+    pub _phantom: PhantomData<S>,
+}
+
+impl<S: Score> ScoringDefinition<S> {
+    pub fn new(
+        source: StreamDefinition<S>,
+        impact_fn_id: FunctionId,
+        constraint_id: String,
+    ) -> Self {
+        Self {
+            source: Box::new(source),
+            impact_fn_id,
+            constraint_id,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct FlatMapDefinition<S: Score> {
     pub source: Box<StreamDefinition<S>>,
-    pub mapper_fn_id: usize,
+    pub mapper_fn_id: FunctionId, // UPDATED: Use FunctionId instead of usize
     pub _phantom: PhantomData<S>,
 }
 
 impl<S: Score> FlatMapDefinition<S> {
-    pub fn new(source: StreamDefinition<S>, mapper_fn_id: usize) -> Self {
+    pub fn new(source: StreamDefinition<S>, mapper_fn_id: FunctionId) -> Self {
         Self {
             source: Box::new(source),
             mapper_fn_id,
@@ -402,7 +447,6 @@ impl<S: Score> FlatMapDefinition<S> {
     }
 }
 
-/// FIXED: High-level stream API with enhanced error handling and zero-copy integration
 #[derive(Clone)]
 pub struct Stream<A, S: Score> {
     pub(crate) definition: StreamDefinition<S>,
@@ -424,9 +468,36 @@ impl<A, S: Score> Stream<A, S> {
     pub fn penalize(self, constraint_id: &str, penalty_function: impl Fn(&AnyTuple) -> S + 'static) -> ConstraintRecipe<S> {
         ConstraintRecipe {
             stream_def: self.definition,
-            penalty_function: Rc::new(penalty_function),
+            penalty_function: crate::nodes::ImpactFn::Traditional(Rc::new(penalty_function)),
             constraint_id: constraint_id.to_string(),
         }
+    }
+
+    /// NEW: Zero-copy penalize method for high performance
+    pub fn penalize_zero_copy(
+        self, 
+        constraint_id: &str, 
+        penalty_function: crate::nodes::ZeroCopyImpactFn<S>
+    ) -> ConstraintRecipe<S> {
+        ConstraintRecipe {
+            stream_def: self.definition,
+            penalty_function: crate::nodes::ImpactFn::ZeroCopy(penalty_function),
+            constraint_id: constraint_id.to_string(),
+        }
+    }
+
+    pub fn flat_map(self, mapper_fn: SharedMapperFn) -> Stream<Arity1, S> {
+        let factory_rc = self.factory.upgrade().expect("ConstraintFactory has been dropped");
+        let mapper_fn_id = factory_rc.borrow_mut().register_mapper(mapper_fn);
+        let flatmap_def = FlatMapDefinition::new(self.definition, FunctionId::Traditional(mapper_fn_id));
+        Stream::new(StreamDefinition::FlatMap(flatmap_def), self.factory)
+    }
+
+    pub fn flat_map_zero_copy(self, mapper_fn: crate::nodes::ZeroCopyMapperFn) -> Stream<Arity1, S> {
+        let factory_rc = self.factory.upgrade().expect("ConstraintFactory has been dropped");
+        let mapper_fn_id = factory_rc.borrow_mut().register_zero_copy_mapper(mapper_fn);
+        let flatmap_def = FlatMapDefinition::new(self.definition, FunctionId::ZeroCopy(mapper_fn_id));
+        Stream::new(StreamDefinition::FlatMap(flatmap_def), self.factory)
     }
 
     pub fn filter(self, predicate: SharedPredicate) -> Self {
@@ -466,15 +537,15 @@ impl<A, S: Score> Stream<A, S> {
         Stream::new(StreamDefinition::ConditionalJoin(cond_def), self.factory)
     }
     
-    /// Get the retrieval ID for this stream
     pub fn get_retrieval_id(&self) -> RetrievalId<S> {
         self.definition.get_retrieval_id()
     }
-    
-    /// Get the expected arity of this stream
+
     pub fn arity(&self) -> usize {
         self.definition.output_arity()
     }
+
+    
 }
 
 impl<S: Score> Stream<Arity1, S> {
@@ -501,44 +572,6 @@ impl<S: Score> Stream<Arity1, S> {
         Stream::new(StreamDefinition::Group(group_def), self.factory)
     }
 
-    pub fn flat_map(self, mapper_fn: SharedMapperFn) -> Stream<Arity1, S> {
-        let factory_rc = self.factory.upgrade().expect("ConstraintFactory has been dropped");
-        let mapper_fn_id = factory_rc.borrow_mut().register_mapper(mapper_fn);
-        let flatmap_def = FlatMapDefinition::new(self.definition, mapper_fn_id);
-        Stream::new(StreamDefinition::FlatMap(flatmap_def), self.factory)
-    }
-
-    pub fn map(self, mapper_fn: Rc<dyn Fn(&AnyTuple) -> Rc<dyn GreynetFact>>) -> Stream<Arity1, S> {
-        let wrapped_mapper: SharedMapperFn = Rc::new(move |tuple: &AnyTuple| {
-            vec![mapper_fn(tuple)]
-        });
-        self.flat_map(wrapped_mapper)
-    }
-
-    pub fn unique_pairs(self) -> Stream<Arity2, S>
-    where
-        S: 'static,
-    {
-        let other = Stream::new(self.definition.clone(), self.factory.clone());
-        self.join(
-            other,
-            JoinerType::LessThan,
-            Rc::new(|tuple: &AnyTuple| {
-                if let AnyTuple::Uni(uni_tuple) = tuple {
-                    uni_tuple.fact_a.hash_fact()
-                } else {
-                    0
-                }
-            }),
-            Rc::new(|tuple: &AnyTuple| {
-                if let AnyTuple::Uni(uni_tuple) = tuple {
-                    uni_tuple.fact_a.hash_fact()
-                } else {
-                    0
-                }
-            }),
-        )
-    }
 }
 
 impl<S: Score> Stream<Arity2, S> {

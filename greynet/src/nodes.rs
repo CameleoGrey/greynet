@@ -16,7 +16,6 @@ use smallvec::SmallVec;
 use std::any::TypeId;
 use std::cell::RefCell;
 use std::rc::Rc;
-use crate::SimdOps;
 use crate::collectors::UndoReceipt;
 
 // --- Function Types ---
@@ -30,6 +29,8 @@ pub type SharedMapperFn = Rc<dyn Fn(&AnyTuple) -> Vec<Rc<dyn crate::fact::Greyne
 // Zero-Copy (new API) function types
 pub type ZeroCopyKeyFn = Rc<dyn Fn(&dyn ZeroCopyFacts) -> u64>;
 pub type ZeroCopyPredicate = Rc<dyn Fn(&dyn ZeroCopyFacts) -> bool>;
+pub type ZeroCopyImpactFn<S> = Rc<dyn Fn(&dyn ZeroCopyFacts) -> S>;
+pub type ZeroCopyMapperFn = Rc<dyn Fn(&dyn ZeroCopyFacts) -> Vec<Rc<dyn crate::fact::GreynetFact>>>;
 
 // --- ENUM WRAPPERS FOR TRUE ZERO-COPY PATH ---
 // These enums allow nodes to hold either a traditional or a zero-copy function,
@@ -46,8 +47,6 @@ impl Predicate {
     fn execute(&self, tuple: &AnyTuple) -> bool {
         match self {
             Predicate::Traditional(p) => p(tuple),
-            // AnyTuple implements ZeroCopyFacts, so we can pass it directly.
-            // This avoids creating a new closure and leverages the trait directly.
             Predicate::ZeroCopy(p) => p(tuple),
         }
     }
@@ -65,6 +64,38 @@ impl KeyFn {
         match self {
             KeyFn::Traditional(k) => k(tuple),
             KeyFn::ZeroCopy(k) => k(tuple),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub enum ImpactFn<S: Score> {
+    Traditional(SharedImpactFn<S>),
+    ZeroCopy(ZeroCopyImpactFn<S>),
+}
+
+impl<S: Score> ImpactFn<S> {
+    #[inline]
+    fn execute(&self, tuple: &AnyTuple) -> S {
+        match self {
+            ImpactFn::Traditional(f) => f(tuple),
+            ImpactFn::ZeroCopy(f) => f(tuple),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub enum MapperFn {
+    Traditional(SharedMapperFn),
+    ZeroCopy(ZeroCopyMapperFn),
+}
+
+impl MapperFn {
+    #[inline]
+    fn execute(&self, tuple: &AnyTuple) -> Vec<Rc<dyn crate::fact::GreynetFact>> {
+        match self {
+            MapperFn::Traditional(f) => f(tuple),
+            MapperFn::ZeroCopy(f) => f(tuple),
         }
     }
 }
@@ -702,17 +733,15 @@ impl std::fmt::Debug for GroupNode {
 }
 
 
-// FlatMapNode and ScoringNode remain largely the same as they don't use
-// the predicate/key function pattern in the same way.
-// ... (FlatMapNode, ScoringNode, etc. are omitted for brevity) ...
+// Updated FlatMapNode to use MapperFn wrapper
 pub struct FlatMapNode {
     pub children: Vec<NodeId>,
-    mapper_fn: SharedMapperFn,
+    mapper_fn: MapperFn, // UPDATED: Use wrapper enum
     parent_to_children_map: HashMap<SafeTupleIndex, Vec<SafeTupleIndex>>,
 }
 
 impl FlatMapNode {
-    pub fn new(mapper_fn: SharedMapperFn) -> Self {
+    pub fn new(mapper_fn: MapperFn) -> Self { // UPDATED: Use wrapper enum
         Self {
             children: Vec::new(),
             mapper_fn,
@@ -727,7 +756,8 @@ impl FlatMapNode {
         operations: &mut Vec<NodeOperation>,
     ) -> Result<()> {
         let parent_tuple = tuples.get_tuple_checked(parent_tuple_idx)?;
-        let new_facts = (self.mapper_fn)(parent_tuple);
+        // UPDATED: Execute via wrapper enum for zero-copy optimization
+        let new_facts = self.mapper_fn.execute(parent_tuple);
 
         if new_facts.is_empty() {
             return Ok(());
@@ -774,9 +804,10 @@ impl std::fmt::Debug for FlatMapNode {
     }
 }
 
+
 pub struct ScoringNode<S: Score> {
     pub constraint_id: String,
-    pub penalty_function: SharedImpactFn<S>,
+    pub penalty_function: ImpactFn<S>, // UPDATED: Use wrapper enum
     pub weights: Rc<RefCell<ConstraintWeights>>,
     pub matches: HashMap<SafeTupleIndex, S>,
 }
@@ -784,7 +815,7 @@ pub struct ScoringNode<S: Score> {
 impl<S: Score> ScoringNode<S> {
     pub fn new(
         constraint_id: String,
-        penalty_function: SharedImpactFn<S>,
+        penalty_function: ImpactFn<S>, // UPDATED: Use wrapper enum
         weights: Rc<RefCell<ConstraintWeights>>,
     ) -> Self {
         Self {
@@ -803,7 +834,8 @@ impl<S: Score> ScoringNode<S> {
         _operations: &mut Vec<NodeOperation>,
     ) -> Result<()> {
         if let Ok(tuple) = tuples.get_tuple_checked(tuple_index) {
-            let base_score = (self.penalty_function)(tuple);
+            // UPDATED: Execute via wrapper enum for zero-copy optimization
+            let base_score = self.penalty_function.execute(tuple);
             let weight = self.weights.borrow().get_weight(&self.constraint_id);
             let weighted_score = base_score.mul(weight);
             self.matches.insert(tuple_index, weighted_score);
@@ -824,19 +856,6 @@ impl<S: Score> ScoringNode<S> {
 
     #[inline]
     pub fn get_total_score(&self) -> S {
-        // Use SIMD for SimpleScore type
-        if cfg!(feature = "simd") && std::any::TypeId::of::<S>() == std::any::TypeId::of::<crate::SimpleScore>() {
-            let scores: Vec<f64> = self.matches.values()
-                .flat_map(|s| s.as_list())
-                .collect();
-            
-            if scores.len() > 64 { // Only use SIMD for larger datasets
-                let total = SimdOps::sum_scores_simd(&scores);
-                return S::from_list(vec![total]);
-            }
-        }
-        
-        // Original implementation for other cases
         self.matches
             .values()
             .fold(S::null_score(), |acc, score| acc + score.clone())
@@ -846,45 +865,16 @@ impl<S: Score> ScoringNode<S> {
         let weight = self.weights.borrow().get_weight(&self.constraint_id);
         for (tuple_idx, score_val) in self.matches.iter_mut() {
             if let Ok(tuple) = tuples.get_tuple_checked(*tuple_idx) {
-                let base_score = (self.penalty_function)(tuple);
+                // UPDATED: Execute via wrapper enum for zero-copy optimization
+                let base_score = self.penalty_function.execute(tuple);
                 *score_val = base_score.mul(weight);
             }
         }
         Ok(())
     }
 
-    // ADD bulk score recalculation with SIMD
     pub fn recalculate_scores_bulk(&mut self, tuples: &TupleArena) -> Result<()> {
-        if cfg!(feature = "simd") && self.matches.len() > 32 {
-            self.recalculate_scores_simd(tuples)
-        } else {
-            self.recalculate_scores(tuples)
-        }
-    }
-
-    #[cfg(feature = "simd")]
-    fn recalculate_scores_simd(&mut self, tuples: &TupleArena) -> Result<()> {
-        let weight = self.weights.borrow().get_weight(&self.constraint_id);
-        
-        // Collect all tuples and calculate scores in batches
-        let tuple_indices: Vec<SafeTupleIndex> = self.matches.keys().copied().collect();
-        let mut new_scores = Vec::with_capacity(tuple_indices.len());
-        
-        for &tuple_idx in &tuple_indices {
-            if let Ok(tuple) = tuples.get_tuple_checked(tuple_idx) {
-                let base_score = (self.penalty_function)(tuple);
-                new_scores.push(base_score.mul(weight));
-            }
-        }
-        
-        // Update all scores at once
-        for (i, &tuple_idx) in tuple_indices.iter().enumerate() {
-            if i < new_scores.len() {
-                self.matches.insert(tuple_idx, new_scores[i].clone());
-            }
-        }
-        
-        Ok(())
+        self.recalculate_scores(tuples)
     }
 
     pub fn match_indices(&self) -> impl Iterator<Item = &SafeTupleIndex> {

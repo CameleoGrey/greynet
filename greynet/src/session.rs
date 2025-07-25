@@ -11,7 +11,6 @@ use rustc_hash::FxHashMap as HashMap;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::cell::RefCell;
-use crate::SimdOps;
 
 /// High-performance session with direct ownership and comprehensive error handling
 #[derive(Debug)]
@@ -235,122 +234,34 @@ impl<S: Score + 'static> Session<S> {
         Ok(())
     }
 
-    /// SIMD-optimized batch insertion for better performance
-    pub fn insert_batch_simd<T: GreynetFact + 'static>(
-        &mut self,
-        facts: impl IntoIterator<Item = T>,
-    ) -> Result<()> {
-        let facts_vec: Vec<T> = facts.into_iter().collect();
-        
-        if facts_vec.is_empty() {
-            return Ok(());
-        }
-
-        // Pre-check all facts for duplicates using SIMD where possible
-        let fact_ids: Vec<uuid::Uuid> = facts_vec.iter().map(|f| f.fact_id()).collect();
-        
-        // Check for existing facts
-        for &fact_id in &fact_ids {
-            if self.fact_to_tuple_map.contains_key(&fact_id) {
-                return Err(GreynetError::duplicate_fact(fact_id));
-            }
-        }
-
-        // Bulk resource limit check
-        self.limits.check_tuple_limit(self.tuples.arena.len() + facts_vec.len())?;
-
-        let fact_type_id = std::any::TypeId::of::<T>();
-        let from_node_id = *self
-            .from_nodes
-            .get(&fact_type_id)
-            .ok_or_else(|| GreynetError::unregistered_type(std::any::type_name::<T>()))?;
-
-        // Bulk create tuples
-        let mut tuple_indices = Vec::with_capacity(facts_vec.len());
-        for (i, fact) in facts_vec.into_iter().enumerate() {
-            let tuple = AnyTuple::Uni(UniTuple::new(Rc::new(fact)));
-            let tuple_index = self.tuples.acquire_tuple(tuple)?;
-            
-            if let Ok(t) = self.tuples.get_tuple_mut_checked(tuple_index) {
-                t.set_node(from_node_id);
-            }
-            
-            tuple_indices.push((fact_ids[i], tuple_index));
-        }
-
-        // Bulk schedule insertions
-        for &(fact_id, tuple_index) in &tuple_indices {
-            match self.scheduler.schedule_insert(tuple_index, &mut self.tuples) {
-                Ok(()) => {
-                    self.fact_to_tuple_map.insert(fact_id, tuple_index);
-                }
-                Err(e) => {
-                    // Cleanup on failure
-                    for &(_, idx) in &tuple_indices {
-                        self.tuples.release_tuple(idx);
-                    }
-                    return Err(e);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Enhanced insert_batch that automatically uses SIMD when available
     pub fn insert_batch<T: GreynetFact + 'static>(
         &mut self,
         facts: impl IntoIterator<Item = T>,
     ) -> Result<()> {
-        if cfg!(feature = "simd") {
-            self.insert_batch_simd(facts)
-        } else {
-            // Original implementation
-            for fact in facts {
-                self.insert(fact)?;
-            }
-            Ok(())
+
+        for fact in facts {
+            self.insert(fact)?;
         }
+        Ok(())
     }
 
-    /// SIMD-optimized score calculation
     pub fn get_score(&mut self) -> Result<S> {
         self.flush()?;
 
-        if cfg!(feature = "simd") && std::any::TypeId::of::<S>() == std::any::TypeId::of::<crate::SimpleScore>() {
-            // Use SIMD for SimpleScore
-            let mut all_scores = Vec::new();
-            
-            for &node_id in &self.scoring_nodes {
-                if let Some(NodeData::Scoring(scoring_node)) = self.nodes.get_node(node_id) {
-                    // Collect raw f64 values for SIMD processing
-                    for score in scoring_node.matches.values() {
-                        all_scores.extend(score.as_list());
-                    }
-                }
+        let total_score = self.scoring_nodes.iter().fold(S::null_score(), |acc, &node_id| {
+            if let Some(NodeData::Scoring(scoring_node)) = self.nodes.get_node(node_id) {
+                acc + scoring_node.get_total_score()
+            } else {
+                acc
             }
-            
-            let total = SimdOps::sum_scores_simd(&all_scores);
-            Ok(S::from_list(vec![total]))
-        } else {
-            // Original implementation for complex scores
-            let total_score = self.scoring_nodes.iter().fold(S::null_score(), |acc, &node_id| {
-                if let Some(NodeData::Scoring(scoring_node)) = self.nodes.get_node(node_id) {
-                    acc + scoring_node.get_total_score()
-                } else {
-                    acc
-                }
-            });
-            Ok(total_score)
-        }
+        });
+        Ok(total_score)
     }
 
-    /// Bulk state transition using SIMD optimization
     pub fn bulk_transition_tuple_states(&mut self, from: TupleState, to: TupleState) -> Result<usize> {
         Ok(self.tuples.bulk_transition_states(from, to))
     }
 
-    /// Enhanced cleanup using SIMD optimization
     pub fn cleanup_dying_tuples(&mut self) -> Result<usize> {
         Ok(self.tuples.cleanup_dying_tuples())
     }

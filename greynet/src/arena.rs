@@ -12,7 +12,6 @@ use generational_arena::{Arena, Index as TupleIndex};
 use rustc_hash::FxHashMap as HashMap;
 use slotmap::{DefaultKey, SlotMap};
 use smallvec::SmallVec;
-use crate::SimdOps;
 
 pub type NodeId = DefaultKey;
 
@@ -21,6 +20,30 @@ pub struct SafeTupleIndex {
     pub(crate) index: TupleIndex,
     pub(crate) generation: u64,
 }
+
+#[inline]
+pub fn bulk_update_states(
+    tuples: &mut [TupleState], 
+    from_state: TupleState, 
+    to_state: TupleState
+) -> usize {
+
+    let mut count = 0;
+    for tuple_state in tuples.iter_mut() {
+        if *tuple_state == from_state {
+            *tuple_state = to_state;
+            count += 1;
+        }
+    }
+    count
+}
+
+#[inline]
+pub fn count_matching_tuples(tuples: &[TupleState], target_state: TupleState) -> usize {
+    // Fallback to scalar implementation
+    tuples.iter().filter(|&&s| s == target_state).count()
+}
+
 
 impl SafeTupleIndex {
     #[inline]
@@ -230,14 +253,8 @@ impl TupleArena {
         }
     }
 
-    /// Enhanced cleanup with SIMD optimization
     pub fn cleanup_dying_tuples(&mut self) -> usize {
-        // Use SIMD version if available, fallback to original if not
-        if cfg!(feature = "simd") {
-            self.cleanup_dying_tuples_simd()
-        } else {
-            self.cleanup_dying_tuples_scalar()
-        }
+        self.cleanup_dying_tuples_scalar()
     }
 
     /// Scalar implementation for cleanup
@@ -262,41 +279,6 @@ impl TupleArena {
         cleaned_count
     }
 
-    /// SIMD-optimized cleanup
-    pub fn cleanup_dying_tuples_simd(&mut self) -> usize {
-        let mut states: Vec<TupleState> = Vec::with_capacity(self.arena.len());
-        let mut indices: Vec<(generational_arena::Index, u64)> = Vec::with_capacity(self.arena.len());
-        
-        // Collect states and indices
-        for (index, tuple) in self.arena.iter() {
-            states.push(tuple.state());
-            let raw_index = index.into_raw_parts().0;
-            if let Some(generation) = self.active_generations.get(raw_index) {
-                indices.push((index, generation));
-            }
-        }
-        
-        // Use SIMD to count dying tuples
-        let dying_count = SimdOps::count_matching_tuples_simd(&states, TupleState::Dying);
-        
-        if dying_count == 0 {
-            return 0;
-        }
-        
-        // Clean up dying tuples
-        let mut cleaned = 0;
-        for (i, (&state, &(index, generation))) in states.iter().zip(indices.iter()).enumerate() {
-            if state == TupleState::Dying {
-                let safe_index = SafeTupleIndex::new(index, generation);
-                self.release_tuple(safe_index);
-                cleaned += 1;
-            }
-        }
-        
-        cleaned
-    }
-
-    /// Bulk state transition with SIMD optimization
     pub fn bulk_transition_states(&mut self, from: TupleState, to: TupleState) -> usize {
         let mut states: Vec<TupleState> = Vec::with_capacity(self.arena.len());
         let mut indices: Vec<SafeTupleIndex> = Vec::with_capacity(self.arena.len());
@@ -310,8 +292,7 @@ impl TupleArena {
             }
         }
         
-        // Use SIMD to update states
-        let updated_count = SimdOps::bulk_update_states_simd(&mut states, from, to);
+        let updated_count = bulk_update_states(&mut states, from, to);
         
         // Apply the updates back to tuples
         for (i, &safe_index) in indices.iter().enumerate() {
@@ -323,34 +304,6 @@ impl TupleArena {
         }
         
         updated_count
-    }
-
-    /// Bulk tuple state analysis with SIMD
-    pub fn analyze_tuple_states(&self) -> HashMap<TupleState, usize> {
-        let mut states: Vec<TupleState> = Vec::with_capacity(self.arena.len());
-        
-        for (_, tuple) in self.arena.iter() {
-            states.push(tuple.state());
-        }
-        
-        let mut counts = HashMap::default();
-        
-        if cfg!(feature = "simd") && states.len() > 64 {
-            // Use SIMD for large datasets
-            counts.insert(TupleState::Creating, SimdOps::count_matching_tuples_simd(&states, TupleState::Creating));
-            counts.insert(TupleState::Ok, SimdOps::count_matching_tuples_simd(&states, TupleState::Ok));
-            counts.insert(TupleState::Updating, SimdOps::count_matching_tuples_simd(&states, TupleState::Updating));
-            counts.insert(TupleState::Dying, SimdOps::count_matching_tuples_simd(&states, TupleState::Dying));
-            counts.insert(TupleState::Aborting, SimdOps::count_matching_tuples_simd(&states, TupleState::Aborting));
-            counts.insert(TupleState::Dead, SimdOps::count_matching_tuples_simd(&states, TupleState::Dead));
-        } else {
-            // Fallback to scalar counting
-            for &state in &states {
-                *counts.entry(state).or_insert(0) += 1;
-            }
-        }
-        
-        counts
     }
 
     /// Pre-allocate tuple slots for bulk operations
@@ -492,9 +445,8 @@ impl<S: Score> NodeData<S> {
             NodeData::Conditional(n) => &mut n.children,
             NodeData::Group(n) => &mut n.children,
             NodeData::FlatMap(n) => &mut n.children,
-            NodeData::Scoring(_)
-            | NodeData::JoinLeftAdapter(_)
-            | NodeData::JoinRightAdapter(_) => return,
+            NodeData::Scoring(n) => return, // Scoring nodes don't have children
+            NodeData::JoinLeftAdapter(_) | NodeData::JoinRightAdapter(_) => return,
         };
         if !children.contains(&child_id) {
             children.push(child_id);

@@ -4,7 +4,6 @@ use crate::state::TupleState;
 use crate::score::Score;
 use crate::{Result, GreynetError, ResourceLimits};
 use std::collections::VecDeque;
-use crate::SimdOps;
 
 /// Object pool for reducing allocations
 #[derive(Debug)]
@@ -109,11 +108,8 @@ impl BatchScheduler {
     }
 
     pub fn execute_all<S: Score>(&mut self, nodes: &mut NodeArena<S>, tuples: &mut TupleArena) -> Result<()> {
-        if cfg!(feature = "simd") && cfg!(target_arch = "x86_64") {
-            self.execute_all_simd(nodes, tuples)
-        } else {
-            self.execute_all_scalar(nodes, tuples)
-        }
+
+        self.execute_all_scalar(nodes, tuples)
     }
 
     // IMPROVED: Add infinite loop prevention and resource limits
@@ -204,43 +200,7 @@ impl BatchScheduler {
             index_buffers_pooled: self.pool.index_buffers.len(),
         }
     }
-
-    /// SIMD-optimized batch processing
-    pub fn execute_all_simd<S: Score>(&mut self, nodes: &mut NodeArena<S>, tuples: &mut TupleArena) -> Result<()> {
-        let mut iteration_count = 0;
-        
-        while !self.pending_queue.is_empty() {
-            iteration_count += 1;
-            if iteration_count > self.limits.max_cascade_depth {
-                return Err(GreynetError::infinite_loop(self.limits.max_cascade_depth));
-            }
-            
-            // Use SIMD for bulk state analysis
-            let pending_states: Vec<TupleState> = self.pending_queue.iter()
-                .filter_map(|&idx| tuples.get_tuple_checked(idx).ok())
-                .map(|t| t.state())
-                .collect();
-            
-            let creating_count = SimdOps::count_matching_tuples_simd(&pending_states, TupleState::Creating);
-            let dying_count = SimdOps::count_matching_tuples_simd(&pending_states, TupleState::Dying);
-            
-            // Check operation limits with SIMD counts
-            self.limits.check_operation_limit(creating_count + dying_count)?;
-            
-            self.prepare_operations_simd(nodes, tuples)?;
-            let ops_to_execute: Vec<NodeOperation> = self.operation_queue.drain(..).collect();
-            NodeArena::execute_operations(ops_to_execute, nodes, tuples)?;
-        }
-        Ok(())
-    }
     
-    fn prepare_operations_simd<S: Score>(&mut self, nodes: &mut NodeArena<S>, tuples: &mut TupleArena) -> Result<()> {
-        // Use SIMD-optimized cleanup
-        tuples.cleanup_dying_tuples_simd();
-        
-        // Continue with regular operation preparation
-        self.prepare_operations(nodes, tuples)
-    }
 }
 
 #[derive(Debug, Clone)]

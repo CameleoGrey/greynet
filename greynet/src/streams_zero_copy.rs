@@ -33,11 +33,6 @@ pub trait ZeroCopyStreamOps<A, S: Score + 'static> {
     /// Filter using zero-copy predicate (much faster than current filter)
     fn filter_zero_copy(self, predicate: ZeroCopyPredicate) -> Self;
     
-    /// Map using zero-copy access (much faster than current map)
-    fn map_zero_copy(self, mapper: Rc<dyn Fn(&dyn ZeroCopyFacts) -> Rc<dyn GreynetFact>>) -> Self;
-    
-    /// FlatMap using zero-copy access (much faster than current flat_map)
-    fn flat_map_zero_copy(self, mapper: ZeroCopyMapperFn) -> Self;
 }
 
 impl<A, S: Score + 'static> ZeroCopyStreamOps<A, S> for Stream<A, S> {
@@ -53,40 +48,6 @@ impl<A, S: Score + 'static> ZeroCopyStreamOps<A, S> for Stream<A, S> {
         };
         
         Stream::new(StreamDefinition::Filter(filter_def), self.factory)
-    }
-    
-    fn map_zero_copy(self, mapper: Rc<dyn Fn(&dyn ZeroCopyFacts) -> Rc<dyn GreynetFact>>) -> Self {
-        // Convert zero-copy mapper to traditional for compatibility
-        let flat_mapper: SharedMapperFn = Rc::new(move |tuple: &AnyTuple| {
-            vec![mapper(tuple)]
-        });
-        
-        let factory_rc = self.factory.upgrade().expect("ConstraintFactory has been dropped");
-        let mapper_id = factory_rc.borrow_mut().register_mapper(flat_mapper);
-        
-        let flatmap_def = FlatMapDefinition {
-            source: Box::new(self.definition),
-            mapper_fn_id: mapper_id,
-            _phantom: PhantomData,
-        };
-        
-        Stream::new(StreamDefinition::FlatMap(flatmap_def), self.factory)
-    }
-    
-    fn flat_map_zero_copy(self, mapper: ZeroCopyMapperFn) -> Self {
-        // Convert zero-copy mapper to traditional for compatibility
-        let traditional_mapper: SharedMapperFn = Rc::new(move |tuple: &AnyTuple| mapper(tuple));
-
-        let factory_rc = self.factory.upgrade().expect("ConstraintFactory has been dropped");
-        let mapper_id = factory_rc.borrow_mut().register_mapper(traditional_mapper);
-        
-        let flatmap_def = FlatMapDefinition {
-            source: Box::new(self.definition),
-            mapper_fn_id: mapper_id,
-            _phantom: PhantomData,
-        };
-        
-        Stream::new(StreamDefinition::FlatMap(flatmap_def), self.factory)
     }
 }
 
@@ -702,6 +663,332 @@ pub mod enhanced_ops {
                 }
             }
             0
+        })
+    }
+}
+
+pub mod enhanced_zero_copy_ops {
+    use super::*;
+    use crate::nodes::{ZeroCopyImpactFn, ZeroCopyMapperFn};
+    use crate::{Score, GreynetFact};
+    use std::collections::HashMap;
+    use std::hash::Hash;
+    use std::rc::Rc;
+
+    // =============================================================================
+    // SCORING FUNCTIONS (for ScoringNode)
+    // =============================================================================
+
+    /// Create a zero-copy impact function for constraint scoring
+    pub fn impact_function<S, F>(scoring_fn: F) -> ZeroCopyImpactFn<S>
+    where
+        S: Score,
+        F: Fn(&dyn ZeroCopyFacts) -> S + 'static,
+    {
+        Rc::new(scoring_fn)
+    }
+
+    /// Create penalty function from field access with type safety
+    pub fn field_penalty<T, F, S>(
+        field_extractor: F,
+        penalty_calculator: impl Fn(&T) -> S + 'static
+    ) -> ZeroCopyImpactFn<S>
+    where
+        T: GreynetFact,
+        F: Fn(&T) -> &T + 'static,
+        S: Score,
+    {
+        Rc::new(move |tuple: &dyn ZeroCopyFacts| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T>())
+                .map(|typed_fact| penalty_calculator(field_extractor(typed_fact)))
+                .unwrap_or_else(|| S::null_score())
+        })
+    }
+
+    /// Create penalty function based on numerical field violations
+    pub fn numerical_violation_penalty<T, F, S>(
+        field_extractor: F,
+        min_value: f64,
+        max_value: f64,
+        penalty_per_unit: f64,
+    ) -> ZeroCopyImpactFn<S>
+    where
+        T: GreynetFact,
+        F: Fn(&T) -> f64 + 'static,
+        S: Score + crate::score::FromSimple,
+    {
+        Rc::new(move |tuple: &dyn ZeroCopyFacts| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T>())
+                .map(|typed_fact| {
+                    let value = field_extractor(typed_fact);
+                    if value < min_value {
+                        S::simple((min_value - value) * penalty_per_unit)
+                    } else if value > max_value {
+                        S::simple((value - max_value) * penalty_per_unit)
+                    } else {
+                        S::null_score()
+                    }
+                })
+                .unwrap_or_else(|| S::null_score())
+        })
+    }
+
+    /// Create hard constraint penalty (violates if condition is false)
+    pub fn hard_constraint<T, F, S>(
+        condition: F,
+        penalty_value: f64,
+    ) -> ZeroCopyImpactFn<S>
+    where
+        T: GreynetFact,
+        F: Fn(&T) -> bool + 'static,
+        S: Score + crate::score::FromHard,
+    {
+        Rc::new(move |tuple: &dyn ZeroCopyFacts| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T>())
+                .map(|typed_fact| {
+                    if condition(typed_fact) {
+                        S::null_score()
+                    } else {
+                        S::hard(penalty_value)
+                    }
+                })
+                .unwrap_or_else(|| S::hard(penalty_value))
+        })
+    }
+
+    /// Create soft constraint penalty (penalizes violations gradually)
+    pub fn soft_constraint<T, F, S>(
+        constraint_fn: F,
+        max_penalty: f64,
+    ) -> ZeroCopyImpactFn<S>
+    where
+        T: GreynetFact,
+        F: Fn(&T) -> f64 + 'static, // Returns violation amount (0.0 = no violation)
+        S: Score + crate::score::FromSoft,
+    {
+        Rc::new(move |tuple: &dyn ZeroCopyFacts| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T>())
+                .map(|typed_fact| {
+                    let violation = constraint_fn(typed_fact);
+                    if violation > 0.0 {
+                        S::soft(violation.min(max_penalty))
+                    } else {
+                        S::null_score()
+                    }
+                })
+                .unwrap_or_else(|| S::null_score())
+        })
+    }
+
+    // =============================================================================
+    // MAPPING FUNCTIONS (for FlatMapNode)
+    // =============================================================================
+
+    /// Create a zero-copy mapper function
+    pub fn mapping_function<F>(mapper_fn: F) -> ZeroCopyMapperFn
+    where
+        F: Fn(&dyn ZeroCopyFacts) -> Vec<Rc<dyn GreynetFact>> + 'static,
+    {
+        Rc::new(mapper_fn)
+    }
+
+    /// Create mapper that extracts field values as new facts
+    pub fn field_extractor_mapper<T, F, V>(
+        field_extractor: F,
+    ) -> ZeroCopyMapperFn
+    where
+        T: GreynetFact,
+        F: Fn(&T) -> V + 'static,
+        V: GreynetFact + Clone,
+    {
+        Rc::new(move |tuple: &dyn ZeroCopyFacts| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T>())
+                .map(|typed_fact| {
+                    let extracted_value = field_extractor(typed_fact);
+                    vec![Rc::new(extracted_value) as Rc<dyn GreynetFact>]
+                })
+                .unwrap_or_else(|| Vec::new())
+        })
+    }
+
+    /// Create mapper that generates derived facts based on computations
+    pub fn computation_mapper<T, F, V>(
+        computation: F,
+    ) -> ZeroCopyMapperFn
+    where
+        T: GreynetFact,
+        F: Fn(&T) -> Vec<V> + 'static,
+        V: GreynetFact,
+    {
+        Rc::new(move |tuple: &dyn ZeroCopyFacts| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T>())
+                .map(|typed_fact| {
+                    computation(typed_fact)
+                        .into_iter()
+                        .map(|v| Rc::new(v) as Rc<dyn GreynetFact>)
+                        .collect()
+                })
+                .unwrap_or_else(|| Vec::new())
+        })
+    }
+
+    /// Create mapper for aggregation/grouping operations
+    pub fn aggregation_mapper<T, K, V, F1, F2>(
+        key_extractor: F1,
+        value_extractor: F2,
+    ) -> ZeroCopyMapperFn
+    where
+        T: GreynetFact,
+        K: Hash + Eq + GreynetFact,
+        V: GreynetFact,
+        F1: Fn(&T) -> K + 'static,
+        F2: Fn(&T) -> V + 'static,
+    {
+        Rc::new(move |tuple: &dyn ZeroCopyFacts| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T>())
+                .map(|typed_fact| {
+                    let key = key_extractor(typed_fact);
+                    let value = value_extractor(typed_fact);
+                    vec![
+                        Rc::new(key) as Rc<dyn GreynetFact>,
+                        Rc::new(value) as Rc<dyn GreynetFact>,
+                    ]
+                })
+                .unwrap_or_else(|| Vec::new())
+        })
+    }
+
+    // =============================================================================
+    // COMPOSITE OPERATIONS
+    // =============================================================================
+
+    /// Create mapper that processes multiple facts in tuple
+    pub fn multi_fact_mapper<F>(
+        processor: F,
+    ) -> ZeroCopyMapperFn
+    where
+        F: Fn(&dyn ZeroCopyFacts) -> Vec<Rc<dyn GreynetFact>> + 'static,
+    {
+        Rc::new(processor)
+    }
+
+    /// Create conditional mapper (only maps if condition is met)
+    pub fn conditional_mapper<T, C, M>(
+        condition: C,
+        mapper: M,
+    ) -> ZeroCopyMapperFn
+    where
+        T: GreynetFact,
+        C: Fn(&T) -> bool + 'static,
+        M: Fn(&T) -> Vec<Rc<dyn GreynetFact>> + 'static,
+    {
+        Rc::new(move |tuple: &dyn ZeroCopyFacts| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T>())
+                .and_then(|typed_fact| {
+                    if condition(typed_fact) {
+                        Some(mapper(typed_fact))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| Vec::new())
+        })
+    }
+
+    // =============================================================================
+    // PERFORMANCE OPTIMIZED OPERATIONS
+    // =============================================================================
+
+    /// Create batch-optimized mapper for high-volume operations
+    pub fn batch_mapper<T, F>(
+        batch_processor: F,
+    ) -> ZeroCopyMapperFn
+    where
+        T: GreynetFact,
+        F: Fn(&[&T]) -> Vec<Vec<Rc<dyn GreynetFact>>> + 'static,
+    {
+        // Note: This is a simplified version. Full implementation would require 
+        // coordination with the scheduling system for true batch processing.
+        Rc::new(move |tuple: &dyn ZeroCopyFacts| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T>())
+                .map(|typed_fact| {
+                    // Process single item as batch of one
+                    let results = batch_processor(&[typed_fact]);
+                    results.into_iter().flatten().collect()
+                })
+                .unwrap_or_else(|| Vec::new())
+        })
+    }
+
+    // =============================================================================
+    // HELPER FUNCTIONS FOR COMMON PATTERNS
+    // =============================================================================
+
+    /// Create impact function that penalizes duplicate values
+    pub fn uniqueness_constraint<T, F, K, S>(
+        key_extractor: F,
+        penalty_per_duplicate: f64,
+    ) -> ZeroCopyImpactFn<S>
+    where
+        T: GreynetFact,
+        F: Fn(&T) -> K + 'static,
+        K: Hash + Eq + Clone + 'static,
+        S: Score + crate::score::FromSoft,
+    {
+        let seen_values = Rc::new(std::cell::RefCell::new(HashMap::<K, usize>::new()));
+        
+        Rc::new(move |tuple: &dyn ZeroCopyFacts| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T>())
+                .map(|typed_fact| {
+                    let key = key_extractor(typed_fact);
+                    let mut seen = seen_values.borrow_mut();
+                    let count = seen.entry(key).or_insert(0);
+                    *count += 1;
+                    
+                    if *count > 1 {
+                        S::soft(penalty_per_duplicate * (*count - 1) as f64)
+                    } else {
+                        S::null_score()
+                    }
+                })
+                .unwrap_or_else(|| S::null_score())
+        })
+    }
+
+    /// Create impact function for capacity constraints
+    pub fn capacity_constraint<T, F, S>(
+        capacity_checker: F,
+        max_capacity: f64,
+        penalty_per_unit_over: f64,
+    ) -> ZeroCopyImpactFn<S>
+    where
+        T: GreynetFact,
+        F: Fn(&T) -> f64 + 'static, // Returns current load/usage
+        S: Score + crate::score::FromSoft,
+    {
+        Rc::new(move |tuple: &dyn ZeroCopyFacts| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T>())
+                .map(|typed_fact| {
+                    let current_load = capacity_checker(typed_fact);
+                    if current_load > max_capacity {
+                        let overflow = current_load - max_capacity;
+                        S::soft(overflow * penalty_per_unit_over)
+                    } else {
+                        S::null_score()
+                    }
+                })
+                .unwrap_or_else(|| S::null_score())
         })
     }
 }

@@ -1,3 +1,5 @@
+//! Fixed node_sharing.rs with proper trait bounds
+
 use crate::arena::NodeId;
 use crate::stream_def::RetrievalId;
 use crate::score::Score;
@@ -29,6 +31,36 @@ impl<S: Score> NodeSharingManager<S> {
             self.nodes.insert(retrieval_id, node_id);
             Ok(())
         }
+    }
+    
+    /// Check if a retrieval ID is already registered
+    pub fn contains(&self, retrieval_id: &RetrievalId<S>) -> bool {
+        self.nodes.contains_key(retrieval_id)
+    }
+    
+    /// Get the number of registered nodes
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+    
+    /// Check if the manager is empty
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+    
+    /// Clear all registered nodes
+    pub fn clear(&mut self) {
+        self.nodes.clear();
+    }
+    
+    /// Get all registered retrieval IDs
+    pub fn retrieval_ids(&self) -> impl Iterator<Item = &RetrievalId<S>> {
+        self.nodes.keys()
+    }
+    
+    /// Get all registered node IDs
+    pub fn node_ids(&self) -> impl Iterator<Item = &NodeId> {
+        self.nodes.values()
     }
 }
 

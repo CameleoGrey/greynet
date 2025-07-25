@@ -25,7 +25,3 @@ slotmap = "1.0"
 uuid = { version = "1.0", features = ["v4", "v5"] }
 thiserror = "1.0"
 crossbeam-deque = "0.8.6"
-
-[features]
-default = ["simd"]
-simd = []
