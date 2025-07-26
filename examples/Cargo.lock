@@ -118,7 +118,7 @@ dependencies = [
 
 [[package]]
 name = "greynet"
-version = "0.5.5"
+version = "0.7.0"
 dependencies = [
  "crossbeam-deque",
  "generational-arena",
@@ -152,6 +152,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f31827a206f56af32e590ba56d5d2d085f558508192593743f16b2306495269f"
 dependencies = [
  "cc",
+]
+
+[[package]]
+name = "individual_constraint_matching"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "greynet",
+ "rand",
+ "rustc-hash 2.1.1",
+ "uuid",
 ]
 
 [[package]]

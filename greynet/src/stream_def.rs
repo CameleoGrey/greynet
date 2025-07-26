@@ -971,3 +971,936 @@ impl<S: Score + 'static> Stream<Arity2, S> {
         Stream::new(StreamDefinition::ConditionalJoin(cond_def), self.factory)
     }
 }
+
+// Add these implementations to the stream_def.rs file, after the existing Stream<Arity1, S> impl
+// Also add this import to the top of stream_def.rs:
+// use std::collections::hash_map::DefaultHasher;
+
+impl<S: Score + 'static> Stream<Arity2, S> {
+    /// Join using the first fact from the BiTuple as the key
+    pub fn join_on_first<T1, T2, F1, F2, K>(
+        self,
+        other: Stream<Arity1, S>,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Stream<Arity3, S>
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        let left_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T1>())
+                .map(|typed_fact| {
+                    let mut hasher = DefaultHasher::new();
+                    left_key_fn(typed_fact).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0)
+        });
+
+        let right_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T2>())
+                .map(|typed_fact| {
+                    let mut hasher = DefaultHasher::new();
+                    right_key_fn(typed_fact).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0)
+        });
+
+        let factory_rc = self.factory.upgrade().expect("ConstraintFactory has been dropped");
+        let mut factory = factory_rc.borrow_mut();
+        
+        let left_key_fn_id = factory.register_zero_copy_key_fn(left_zero_copy_key_fn);
+        let right_key_fn_id = factory.register_zero_copy_key_fn(right_zero_copy_key_fn);
+        
+        let join_def = JoinDefinition::new(
+            self.definition,
+            other.definition,
+            JoinerType::Equal,
+            FunctionId(left_key_fn_id),
+            FunctionId(right_key_fn_id),
+        );
+        
+        Stream::new(StreamDefinition::Join(join_def), self.factory)
+    }
+
+    /// Join using the second fact from the BiTuple as the key
+    pub fn join_on_second<T1, T2, F1, F2, K>(
+        self,
+        other: Stream<Arity1, S>,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Stream<Arity3, S>
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        let left_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            tuple.get_fact_ref(1) // Second fact (index 1)
+                .and_then(|fact| fact.as_any().downcast_ref::<T1>())
+                .map(|typed_fact| {
+                    let mut hasher = DefaultHasher::new();
+                    left_key_fn(typed_fact).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0)
+        });
+
+        let right_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T2>())
+                .map(|typed_fact| {
+                    let mut hasher = DefaultHasher::new();
+                    right_key_fn(typed_fact).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0)
+        });
+
+        let factory_rc = self.factory.upgrade().expect("ConstraintFactory has been dropped");
+        let mut factory = factory_rc.borrow_mut();
+        
+        let left_key_fn_id = factory.register_zero_copy_key_fn(left_zero_copy_key_fn);
+        let right_key_fn_id = factory.register_zero_copy_key_fn(right_zero_copy_key_fn);
+        
+        let join_def = JoinDefinition::new(
+            self.definition,
+            other.definition,
+            JoinerType::Equal,
+            FunctionId(left_key_fn_id),
+            FunctionId(right_key_fn_id),
+        );
+        
+        Stream::new(StreamDefinition::Join(join_def), self.factory)
+    }
+
+    /// Join BiTuple with another BiTuple using first facts from both
+    pub fn join_on_both_first<T1, T2, F1, F2, K>(
+        self,
+        other: Stream<Arity2, S>,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Stream<Arity4, S>
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        let left_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T1>())
+                .map(|typed_fact| {
+                    let mut hasher = DefaultHasher::new();
+                    left_key_fn(typed_fact).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0)
+        });
+
+        let right_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T2>())
+                .map(|typed_fact| {
+                    let mut hasher = DefaultHasher::new();
+                    right_key_fn(typed_fact).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0)
+        });
+
+        let factory_rc = self.factory.upgrade().expect("ConstraintFactory has been dropped");
+        let mut factory = factory_rc.borrow_mut();
+        
+        let left_key_fn_id = factory.register_zero_copy_key_fn(left_zero_copy_key_fn);
+        let right_key_fn_id = factory.register_zero_copy_key_fn(right_zero_copy_key_fn);
+        
+        let join_def = JoinDefinition::new(
+            self.definition,
+            other.definition,
+            JoinerType::Equal,
+            FunctionId(left_key_fn_id),
+            FunctionId(right_key_fn_id),
+        );
+        
+        Stream::new(StreamDefinition::Join(join_def), self.factory)
+    }
+
+    /// Join using composite key from both facts in BiTuple
+    pub fn join_on_composite<T1, T2, T3, F1, F2, K>(
+        self,
+        other: Stream<Arity1, S>,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Stream<Arity3, S>
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        T3: GreynetFact,
+        F1: Fn(&T1, &T2) -> K + 'static,
+        F2: Fn(&T3) -> K + 'static,
+        K: Hash + 'static,
+    {
+        let left_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            if let (Some(fact1), Some(fact2)) = (tuple.get_fact_ref(0), tuple.get_fact_ref(1)) {
+                if let (Some(typed_fact1), Some(typed_fact2)) = (
+                    fact1.as_any().downcast_ref::<T1>(),
+                    fact2.as_any().downcast_ref::<T2>(),
+                ) {
+                    let mut hasher = DefaultHasher::new();
+                    left_key_fn(typed_fact1, typed_fact2).hash(&mut hasher);
+                    return hasher.finish();
+                }
+            }
+            0
+        });
+
+        let right_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T3>())
+                .map(|typed_fact| {
+                    let mut hasher = DefaultHasher::new();
+                    right_key_fn(typed_fact).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0)
+        });
+
+        let factory_rc = self.factory.upgrade().expect("ConstraintFactory has been dropped");
+        let mut factory = factory_rc.borrow_mut();
+        
+        let left_key_fn_id = factory.register_zero_copy_key_fn(left_zero_copy_key_fn);
+        let right_key_fn_id = factory.register_zero_copy_key_fn(right_zero_copy_key_fn);
+        
+        let join_def = JoinDefinition::new(
+            self.definition,
+            other.definition,
+            JoinerType::Equal,
+            FunctionId(left_key_fn_id),
+            FunctionId(right_key_fn_id),
+        );
+        
+        Stream::new(StreamDefinition::Join(join_def), self.factory)
+    }
+}
+
+impl<S: Score + 'static> Stream<Arity3, S> {
+    /// Join using the first fact from the TriTuple as the key
+    pub fn join_on_first<T1, T2, F1, F2, K>(
+        self,
+        other: Stream<Arity1, S>,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Stream<Arity4, S>
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        self.join_on_indexed(other, 0, left_key_fn, right_key_fn)
+    }
+
+    /// Join using the second fact from the TriTuple as the key
+    pub fn join_on_second<T1, T2, F1, F2, K>(
+        self,
+        other: Stream<Arity1, S>,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Stream<Arity4, S>
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        self.join_on_indexed(other, 1, left_key_fn, right_key_fn)
+    }
+
+    /// Join using the third fact from the TriTuple as the key
+    pub fn join_on_third<T1, T2, F1, F2, K>(
+        self,
+        other: Stream<Arity1, S>,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Stream<Arity4, S>
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        self.join_on_indexed(other, 2, left_key_fn, right_key_fn)
+    }
+
+    /// Join using any fact from TriTuple by index
+    pub fn join_on_indexed<T1, T2, F1, F2, K>(
+        self,
+        other: Stream<Arity1, S>,
+        fact_index: usize,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Stream<Arity4, S>
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        let left_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            tuple.get_fact_ref(fact_index)
+                .and_then(|fact| fact.as_any().downcast_ref::<T1>())
+                .map(|typed_fact| {
+                    let mut hasher = DefaultHasher::new();
+                    left_key_fn(typed_fact).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0)
+        });
+
+        let right_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T2>())
+                .map(|typed_fact| {
+                    let mut hasher = DefaultHasher::new();
+                    right_key_fn(typed_fact).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0)
+        });
+
+        let factory_rc = self.factory.upgrade().expect("ConstraintFactory has been dropped");
+        let mut factory = factory_rc.borrow_mut();
+        
+        let left_key_fn_id = factory.register_zero_copy_key_fn(left_zero_copy_key_fn);
+        let right_key_fn_id = factory.register_zero_copy_key_fn(right_zero_copy_key_fn);
+        
+        let join_def = JoinDefinition::new(
+            self.definition,
+            other.definition,
+            JoinerType::Equal,
+            FunctionId(left_key_fn_id),
+            FunctionId(right_key_fn_id),
+        );
+        
+        Stream::new(StreamDefinition::Join(join_def), self.factory)
+    }
+
+    /// Join TriTuple with BiTuple to create PentaTuple
+    pub fn join_on_first_to_first<T1, T2, F1, F2, K>(
+        self,
+        other: Stream<Arity2, S>,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Stream<Arity5, S>
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        let left_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T1>())
+                .map(|typed_fact| {
+                    let mut hasher = DefaultHasher::new();
+                    left_key_fn(typed_fact).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0)
+        });
+
+        let right_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T2>())
+                .map(|typed_fact| {
+                    let mut hasher = DefaultHasher::new();
+                    right_key_fn(typed_fact).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0)
+        });
+
+        let factory_rc = self.factory.upgrade().expect("ConstraintFactory has been dropped");
+        let mut factory = factory_rc.borrow_mut();
+        
+        let left_key_fn_id = factory.register_zero_copy_key_fn(left_zero_copy_key_fn);
+        let right_key_fn_id = factory.register_zero_copy_key_fn(right_zero_copy_key_fn);
+        
+        let join_def = JoinDefinition::new(
+            self.definition,
+            other.definition,
+            JoinerType::Equal,
+            FunctionId(left_key_fn_id),
+            FunctionId(right_key_fn_id),
+        );
+        
+        Stream::new(StreamDefinition::Join(join_def), self.factory)
+    }
+}
+
+impl<S: Score + 'static> Stream<Arity4, S> {
+    /// Join QuadTuple with UniTuple using first fact as key
+    pub fn join_on_first<T1, T2, F1, F2, K>(
+        self,
+        other: Stream<Arity1, S>,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Stream<Arity5, S>
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        self.join_on_indexed(other, 0, left_key_fn, right_key_fn)
+    }
+
+    /// Join using any fact from QuadTuple by index
+    pub fn join_on_indexed<T1, T2, F1, F2, K>(
+        self,
+        other: Stream<Arity1, S>,
+        fact_index: usize,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Stream<Arity5, S>
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        let left_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            tuple.get_fact_ref(fact_index)
+                .and_then(|fact| fact.as_any().downcast_ref::<T1>())
+                .map(|typed_fact| {
+                    let mut hasher = DefaultHasher::new();
+                    left_key_fn(typed_fact).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0)
+        });
+
+        let right_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T2>())
+                .map(|typed_fact| {
+                    let mut hasher = DefaultHasher::new();
+                    right_key_fn(typed_fact).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0)
+        });
+
+        let factory_rc = self.factory.upgrade().expect("ConstraintFactory has been dropped");
+        let mut factory = factory_rc.borrow_mut();
+        
+        let left_key_fn_id = factory.register_zero_copy_key_fn(left_zero_copy_key_fn);
+        let right_key_fn_id = factory.register_zero_copy_key_fn(right_zero_copy_key_fn);
+        
+        let join_def = JoinDefinition::new(
+            self.definition,
+            other.definition,
+            JoinerType::Equal,
+            FunctionId(left_key_fn_id),
+            FunctionId(right_key_fn_id),
+        );
+        
+        Stream::new(StreamDefinition::Join(join_def), self.factory)
+    }
+}
+
+impl<S: Score + 'static> Stream<Arity5, S> {
+    // PentaTuple is the maximum arity, so joins from here would exceed the limit
+    // We provide methods that return Result to handle the overflow case
+    
+    /// Attempt to join with overflow check - returns error if result would exceed Arity5
+    pub fn try_join_on_indexed<T1, T2, F1, F2, K>(
+        self,
+        _other: Stream<Arity1, S>,
+        _fact_index: usize,
+        _left_key_fn: F1,
+        _right_key_fn: F2,
+    ) -> Result<(), crate::GreynetError>
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        // Joining Arity5 + Arity1 would create Arity6, which exceeds the limit
+        Err(crate::GreynetError::invalid_arity(5, 6))
+    }
+}
+
+// Convenience methods for indexed joins across all arities
+impl<S: Score + 'static> Stream<Arity2, S> {
+    /// Generic indexed join method
+    pub fn join_on_indexed<T1, T2, F1, F2, K>(
+        self,
+        other: Stream<Arity1, S>,
+        fact_index: usize,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Stream<Arity3, S>
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        match fact_index {
+            0 => self.join_on_first(other, left_key_fn, right_key_fn),
+            1 => self.join_on_second(other, left_key_fn, right_key_fn),
+            _ => panic!("Invalid fact index {} for Arity2 stream (valid: 0-1)", fact_index),
+        }
+    }
+}
+
+// =============================================================================
+// REVERSE DIRECTION JOINS (Lower arity + Higher arity)
+// =============================================================================
+
+// Additional methods for Stream<Arity1, S> to join with higher arity streams
+impl<S: Score + 'static> Stream<Arity1, S> {
+    /// Join UniTuple with BiTuple using first fact from BiTuple
+    pub fn join_with_bi_first<T1, T2, F1, F2, K>(
+        self,
+        other: Stream<Arity2, S>,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Stream<Arity3, S>
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        let left_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T1>())
+                .map(|typed_fact| {
+                    let mut hasher = DefaultHasher::new();
+                    left_key_fn(typed_fact).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0)
+        });
+
+        let right_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T2>())
+                .map(|typed_fact| {
+                    let mut hasher = DefaultHasher::new();
+                    right_key_fn(typed_fact).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0)
+        });
+
+        let factory_rc = self.factory.upgrade().expect("ConstraintFactory has been dropped");
+        let mut factory = factory_rc.borrow_mut();
+        
+        let left_key_fn_id = factory.register_zero_copy_key_fn(left_zero_copy_key_fn);
+        let right_key_fn_id = factory.register_zero_copy_key_fn(right_zero_copy_key_fn);
+        
+        let join_def = JoinDefinition::new(
+            self.definition,
+            other.definition,
+            JoinerType::Equal,
+            FunctionId(left_key_fn_id),
+            FunctionId(right_key_fn_id),
+        );
+        
+        Stream::new(StreamDefinition::Join(join_def), self.factory)
+    }
+
+    /// Join UniTuple with BiTuple using second fact from BiTuple
+    pub fn join_with_bi_second<T1, T2, F1, F2, K>(
+        self,
+        other: Stream<Arity2, S>,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Stream<Arity3, S>
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        let left_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T1>())
+                .map(|typed_fact| {
+                    let mut hasher = DefaultHasher::new();
+                    left_key_fn(typed_fact).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0)
+        });
+
+        let right_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            tuple.get_fact_ref(1) // Second fact
+                .and_then(|fact| fact.as_any().downcast_ref::<T2>())
+                .map(|typed_fact| {
+                    let mut hasher = DefaultHasher::new();
+                    right_key_fn(typed_fact).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0)
+        });
+
+        let factory_rc = self.factory.upgrade().expect("ConstraintFactory has been dropped");
+        let mut factory = factory_rc.borrow_mut();
+        
+        let left_key_fn_id = factory.register_zero_copy_key_fn(left_zero_copy_key_fn);
+        let right_key_fn_id = factory.register_zero_copy_key_fn(right_zero_copy_key_fn);
+        
+        let join_def = JoinDefinition::new(
+            self.definition,
+            other.definition,
+            JoinerType::Equal,
+            FunctionId(left_key_fn_id),
+            FunctionId(right_key_fn_id),
+        );
+        
+        Stream::new(StreamDefinition::Join(join_def), self.factory)
+    }
+
+    /// Join UniTuple with TriTuple using indexed fact from TriTuple
+    pub fn join_with_tri_indexed<T1, T2, F1, F2, K>(
+        self,
+        other: Stream<Arity3, S>,
+        fact_index: usize,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Stream<Arity4, S>
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        let left_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T1>())
+                .map(|typed_fact| {
+                    let mut hasher = DefaultHasher::new();
+                    left_key_fn(typed_fact).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0)
+        });
+
+        let right_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            tuple.get_fact_ref(fact_index)
+                .and_then(|fact| fact.as_any().downcast_ref::<T2>())
+                .map(|typed_fact| {
+                    let mut hasher = DefaultHasher::new();
+                    right_key_fn(typed_fact).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0)
+        });
+
+        let factory_rc = self.factory.upgrade().expect("ConstraintFactory has been dropped");
+        let mut factory = factory_rc.borrow_mut();
+        
+        let left_key_fn_id = factory.register_zero_copy_key_fn(left_zero_copy_key_fn);
+        let right_key_fn_id = factory.register_zero_copy_key_fn(right_zero_copy_key_fn);
+        
+        let join_def = JoinDefinition::new(
+            self.definition,
+            other.definition,
+            JoinerType::Equal,
+            FunctionId(left_key_fn_id),
+            FunctionId(right_key_fn_id),
+        );
+        
+        Stream::new(StreamDefinition::Join(join_def), self.factory)
+    }
+
+    /// Join UniTuple with QuadTuple using indexed fact from QuadTuple
+    pub fn join_with_quad_indexed<T1, T2, F1, F2, K>(
+        self,
+        other: Stream<Arity4, S>,
+        fact_index: usize,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Stream<Arity5, S>
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        let left_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T1>())
+                .map(|typed_fact| {
+                    let mut hasher = DefaultHasher::new();
+                    left_key_fn(typed_fact).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0)
+        });
+
+        let right_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            tuple.get_fact_ref(fact_index)
+                .and_then(|fact| fact.as_any().downcast_ref::<T2>())
+                .map(|typed_fact| {
+                    let mut hasher = DefaultHasher::new();
+                    right_key_fn(typed_fact).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0)
+        });
+
+        let factory_rc = self.factory.upgrade().expect("ConstraintFactory has been dropped");
+        let mut factory = factory_rc.borrow_mut();
+        
+        let left_key_fn_id = factory.register_zero_copy_key_fn(left_zero_copy_key_fn);
+        let right_key_fn_id = factory.register_zero_copy_key_fn(right_zero_copy_key_fn);
+        
+        let join_def = JoinDefinition::new(
+            self.definition,
+            other.definition,
+            JoinerType::Equal,
+            FunctionId(left_key_fn_id),
+            FunctionId(right_key_fn_id),
+        );
+        
+        Stream::new(StreamDefinition::Join(join_def), self.factory)
+    }
+
+    /// Try to join UniTuple with PentaTuple (would exceed max arity)
+    pub fn try_join_with_penta<T1, T2, F1, F2, K>(
+        self,
+        _other: Stream<Arity5, S>,
+        _fact_index: usize,
+        _left_key_fn: F1,
+        _right_key_fn: F2,
+    ) -> Result<(), crate::GreynetError>
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        // Joining Arity1 + Arity5 would create Arity6, which exceeds the limit
+        Err(crate::GreynetError::invalid_arity(5, 6))
+    }
+}
+
+// Additional methods for Stream<Arity2, S> to join with higher arity streams
+impl<S: Score + 'static> Stream<Arity2, S> {
+    /// Join BiTuple with TriTuple using indexed facts
+    pub fn join_with_tri_indexed<T1, T2, F1, F2, K>(
+        self,
+        other: Stream<Arity3, S>,
+        left_fact_index: usize,
+        right_fact_index: usize,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Stream<Arity5, S>
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        let left_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            tuple.get_fact_ref(left_fact_index)
+                .and_then(|fact| fact.as_any().downcast_ref::<T1>())
+                .map(|typed_fact| {
+                    let mut hasher = DefaultHasher::new();
+                    left_key_fn(typed_fact).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0)
+        });
+
+        let right_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            tuple.get_fact_ref(right_fact_index)
+                .and_then(|fact| fact.as_any().downcast_ref::<T2>())
+                .map(|typed_fact| {
+                    let mut hasher = DefaultHasher::new();
+                    right_key_fn(typed_fact).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0)
+        });
+
+        let factory_rc = self.factory.upgrade().expect("ConstraintFactory has been dropped");
+        let mut factory = factory_rc.borrow_mut();
+        
+        let left_key_fn_id = factory.register_zero_copy_key_fn(left_zero_copy_key_fn);
+        let right_key_fn_id = factory.register_zero_copy_key_fn(right_zero_copy_key_fn);
+        
+        let join_def = JoinDefinition::new(
+            self.definition,
+            other.definition,
+            JoinerType::Equal,
+            FunctionId(left_key_fn_id),
+            FunctionId(right_key_fn_id),
+        );
+        
+        Stream::new(StreamDefinition::Join(join_def), self.factory)
+    }
+
+    /// Try to join BiTuple with QuadTuple (would exceed max arity)
+    pub fn try_join_with_quad<T1, T2, F1, F2, K>(
+        self,
+        _other: Stream<Arity4, S>,
+        _left_fact_index: usize,
+        _right_fact_index: usize,
+        _left_key_fn: F1,
+        _right_key_fn: F2,
+    ) -> Result<(), crate::GreynetError>
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        // Joining Arity2 + Arity4 would create Arity6, which exceeds the limit
+        Err(crate::GreynetError::invalid_arity(5, 6))
+    }
+}
+
+// Additional methods for Stream<Arity3, S> to join with higher arity streams
+impl<S: Score + 'static> Stream<Arity3, S> {
+    /// Try to join TriTuple with TriTuple (would exceed max arity)
+    pub fn try_join_with_tri<T1, T2, F1, F2, K>(
+        self,
+        _other: Stream<Arity3, S>,
+        _left_fact_index: usize,
+        _right_fact_index: usize,
+        _left_key_fn: F1,
+        _right_key_fn: F2,
+    ) -> Result<(), crate::GreynetError>
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        // Joining Arity3 + Arity3 would create Arity6, which exceeds the limit
+        Err(crate::GreynetError::invalid_arity(5, 6))
+    }
+}
+
+// Convenience methods with descriptive names
+impl<S: Score + 'static> Stream<Arity1, S> {
+    /// Join with first fact of BiTuple
+    pub fn join_with_bi_first_fact<T1, T2, F1, F2, K>(
+        self,
+        other: Stream<Arity2, S>,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Stream<Arity3, S>
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        self.join_with_bi_first(other, left_key_fn, right_key_fn)
+    }
+
+    /// Join with second fact of BiTuple
+    pub fn join_with_bi_second_fact<T1, T2, F1, F2, K>(
+        self,
+        other: Stream<Arity2, S>,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Stream<Arity3, S>
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        self.join_with_bi_second(other, left_key_fn, right_key_fn)
+    }
+
+    /// Join with first fact of TriTuple
+    pub fn join_with_tri_first<T1, T2, F1, F2, K>(
+        self,
+        other: Stream<Arity3, S>,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Stream<Arity4, S>
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        self.join_with_tri_indexed(other, 0, left_key_fn, right_key_fn)
+    }
+
+    /// Join with second fact of TriTuple
+    pub fn join_with_tri_second<T1, T2, F1, F2, K>(
+        self,
+        other: Stream<Arity3, S>,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Stream<Arity4, S>
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        self.join_with_tri_indexed(other, 1, left_key_fn, right_key_fn)
+    }
+
+    /// Join with third fact of TriTuple
+    pub fn join_with_tri_third<T1, T2, F1, F2, K>(
+        self,
+        other: Stream<Arity3, S>,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Stream<Arity4, S>
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        self.join_with_tri_indexed(other, 2, left_key_fn, right_key_fn)
+    }
+}

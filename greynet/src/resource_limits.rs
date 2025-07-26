@@ -17,13 +17,15 @@ pub struct ResourceLimits {
 }
 
 impl Default for ResourceLimits {
+
+    /// No limits by default
     fn default() -> Self {
         Self {
-            max_tuples: 10_000_000,
-            max_operations_per_batch: 100_000,
-            max_memory_mb: 2048,
-            max_cascade_depth: 1000,
-            max_facts_per_type: 1_000_000,
+            max_tuples: std::usize::MAX,
+            max_operations_per_batch: std::usize::MAX,
+            max_memory_mb: std::usize::MAX,
+            max_cascade_depth: std::usize::MAX,
+            max_facts_per_type: std::usize::MAX,
         }
     }
 }

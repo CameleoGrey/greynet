@@ -1,11 +1,12 @@
-//scheduler.rs
+// scheduler.rs
+
 use crate::arena::{NodeArena, SafeTupleIndex, TupleArena, NodeOperation};
 use crate::state::TupleState;
 use crate::score::Score;
 use crate::{Result, GreynetError, ResourceLimits};
 use std::collections::VecDeque;
 
-/// Object pool for reducing allocations
+/// Object pool for reducing allocations of temporary vectors during scheduling.
 #[derive(Debug)]
 pub struct OperationPool {
     operation_buffers: Vec<Vec<NodeOperation>>,
@@ -20,24 +21,29 @@ impl OperationPool {
         }
     }
 
+    /// Acquires a buffer for node operations from the pool, or creates one if none are available.
     #[inline]
     pub fn get_operation_buffer(&mut self) -> Vec<NodeOperation> {
         self.operation_buffers.pop().unwrap_or_else(|| Vec::with_capacity(128))
     }
     
+    /// Returns an operation buffer to the pool for reuse.
     #[inline]
     pub fn return_operation_buffer(&mut self, mut buffer: Vec<NodeOperation>) {
         buffer.clear();
+        // Only pool reasonably-sized buffers to avoid holding onto large allocations.
         if buffer.capacity() <= 512 {
             self.operation_buffers.push(buffer);
         }
     }
 
+    /// Acquires a buffer for tuple indices from the pool.
     #[inline]
     pub fn get_index_buffer(&mut self) -> Vec<SafeTupleIndex> {
         self.index_buffers.pop().unwrap_or_else(|| Vec::with_capacity(64))
     }
     
+    /// Returns an index buffer to the pool for reuse.
     #[inline]
     pub fn return_index_buffer(&mut self, mut buffer: Vec<SafeTupleIndex>) {
         buffer.clear();
@@ -47,7 +53,9 @@ impl OperationPool {
     }
 }
 
-/// High-performance batch scheduler with object pooling and safety guarantees
+/// High-performance batch scheduler with object pooling and safety guarantees.
+/// It processes tuple insertions and retractions, generating a cascade of
+/// node operations that are executed until the network reaches a stable state.
 #[derive(Debug)]
 pub struct BatchScheduler {
     pending_queue: VecDeque<SafeTupleIndex>,
@@ -57,10 +65,12 @@ pub struct BatchScheduler {
 }
 
 impl BatchScheduler {
+    /// Creates a new scheduler with default resource limits.
     pub fn new() -> Self {
         Self::with_limits(ResourceLimits::default())
     }
     
+    /// Creates a new scheduler with custom resource limits.
     pub fn with_limits(limits: ResourceLimits) -> Self {
         Self {
             pending_queue: VecDeque::new(),
@@ -70,6 +80,7 @@ impl BatchScheduler {
         }
     }
 
+    /// Schedules a tuple for insertion into the network.
     #[inline]
     pub fn schedule_insert(&mut self, tuple_index: SafeTupleIndex, tuples: &mut TupleArena) -> Result<()> {
         if let Ok(tuple) = tuples.get_tuple_mut_checked(tuple_index) {
@@ -85,15 +96,18 @@ impl BatchScheduler {
         }
     }
 
+    /// Schedules a tuple for retraction from the network.
     #[inline]
     pub fn schedule_retract(&mut self, tuple_index: SafeTupleIndex, tuples: &mut TupleArena) -> Result<()> {
         if let Ok(tuple) = tuples.get_tuple_mut_checked(tuple_index) {
             match tuple.state() {
                 TupleState::Creating => {
+                    // If the tuple is still being created, abort its creation.
                     tuple.set_state(TupleState::Aborting);
                     Ok(())
                 }
                 TupleState::Ok => {
+                    // If the tuple is stable, mark it for retraction.
                     tuple.set_state(TupleState::Dying);
                     self.pending_queue.push_back(tuple_index);
                     Ok(())
@@ -107,33 +121,54 @@ impl BatchScheduler {
         }
     }
 
+    /// Executes all pending operations until the network is stable.
     pub fn execute_all<S: Score>(&mut self, nodes: &mut NodeArena<S>, tuples: &mut TupleArena) -> Result<()> {
-
         self.execute_all_scalar(nodes, tuples)
     }
 
-    // IMPROVED: Add infinite loop prevention and resource limits
+    // The main execution loop delays tuple release until the entire batch is processed.
+    // This prevents use-after-free errors by ensuring a tuple is not deallocated
+    // while other operations in the same batch may still need to reference it.
     pub fn execute_all_scalar<S: Score>(&mut self, nodes: &mut NodeArena<S>, tuples: &mut TupleArena) -> Result<()> {
         let mut iteration_count = 0;
-        
+        // Collect all tuples that are marked as dead during the batch execution.
+        // They will be released only at the very end of the process.
+        let mut final_release_list = self.pool.get_index_buffer();
+
         while !self.pending_queue.is_empty() {
             iteration_count += 1;
             if iteration_count > self.limits.max_cascade_depth {
+                self.pool.return_index_buffer(final_release_list); // Avoid leaking the buffer on error
                 return Err(GreynetError::infinite_loop(self.limits.max_cascade_depth));
             }
             
-            // Check operation limits
             self.limits.check_operation_limit(self.operation_queue.len())?;
             
-            self.prepare_operations(nodes, tuples)?;
+            // `prepare_operations` returns a list of tuples that have been marked as 'Dead'.
+            // We collect them here but do not release them from the arena yet.
+            let newly_dead = self.prepare_operations(nodes, tuples)?;
+            final_release_list.extend_from_slice(&newly_dead);
+            
             let ops_to_execute: Vec<NodeOperation> = self.operation_queue.drain(..).collect();
+            
+            // Execute the cascaded operations. The initial tuples are still alive in the arena,
+            // preventing any use-after-free errors.
             NodeArena::execute_operations(ops_to_execute, nodes, tuples)?;
         }
+
+        // After all operations and their cascades are complete, it is now safe to release the initial tuples.
+        for tuple_index in final_release_list.iter() {
+            tuples.release_tuple(*tuple_index);
+        }
+        self.pool.return_index_buffer(final_release_list);
+
         Ok(())
     }
 
-    fn prepare_operations<S: Score>(&mut self, nodes: &mut NodeArena<S>, tuples: &mut TupleArena) -> Result<()> {
-        let mut dead_tuples = self.pool.get_index_buffer();
+    // This function returns a list of tuples that should be released by the caller
+    // once all operations for the current batch are complete.
+    fn prepare_operations<S: Score>(&mut self, nodes: &mut NodeArena<S>, tuples: &mut TupleArena) -> Result<Vec<SafeTupleIndex>> {
+        let mut dead_tuples_for_release = self.pool.get_index_buffer();
         let mut processed_tuples = Vec::new();
         let mut new_operations = self.pool.get_operation_buffer();
 
@@ -141,7 +176,8 @@ impl BatchScheduler {
             let (current_state, node_id) = if let Ok(tuple) = tuples.get_tuple_checked(tuple_index) {
                 (tuple.state(), tuple.node())
             } else {
-                continue; // Skip invalid indices
+                // Skip invalid indices, as they may have been released in a sub-cascade.
+                continue; 
             };
 
             processed_tuples.push((tuple_index, current_state));
@@ -164,7 +200,7 @@ impl BatchScheduler {
         self.operation_queue.extend(new_operations.drain(..));
         self.pool.return_operation_buffer(new_operations);
 
-        // Update states and collect dead tuples
+        // Update tuple states and collect indices of dead tuples for later release.
         for (tuple_index, previous_state) in processed_tuples {
             match previous_state {
                 TupleState::Creating => {
@@ -176,22 +212,18 @@ impl BatchScheduler {
                     if let Ok(tuple) = tuples.get_tuple_mut_checked(tuple_index) {
                         tuple.set_state(TupleState::Dead);
                     }
-                    dead_tuples.push(tuple_index);
+                    // Add to the list to be returned; do not release from the arena here.
+                    dead_tuples_for_release.push(tuple_index);
                 }
                 _ => {}
             }
         }
 
-        // Release dead tuples
-        for tuple_index in dead_tuples.iter() {
-            tuples.release_tuple(*tuple_index);
-        }
-        
-        self.pool.return_index_buffer(dead_tuples);
-        Ok(())
+        // Return the list of dead tuples to the caller.
+        Ok(dead_tuples_for_release)
     }
     
-    /// Get current scheduler statistics
+    /// Gets current statistics about the scheduler's state.
     pub fn stats(&self) -> SchedulerStats {
         SchedulerStats {
             pending_operations: self.pending_queue.len(),
@@ -203,6 +235,7 @@ impl BatchScheduler {
     
 }
 
+/// Contains statistics about the scheduler's internal queues and pools.
 #[derive(Debug, Clone)]
 pub struct SchedulerStats {
     pub pending_operations: usize,

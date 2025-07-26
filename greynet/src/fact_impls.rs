@@ -117,3 +117,27 @@ impl GreynetFact for Vec<AnyTuple> {
         self
     }
 }
+
+impl GreynetFact for Uuid {
+    fn fact_id(&self) -> Uuid { 
+        *self 
+    }
+
+    fn clone_fact(&self) -> Box<dyn GreynetFact> { 
+        Box::new(*self) 
+    }
+
+    fn eq_fact(&self, other: &dyn GreynetFact) -> bool {
+        other.as_any().downcast_ref::<Uuid>().map_or(false, |other_uuid| self == other_uuid)
+    }
+
+    fn hash_fact(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}

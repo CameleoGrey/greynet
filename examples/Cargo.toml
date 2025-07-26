@@ -1,7 +1,7 @@
 
 [workspace]
 resolver = "2"
-members = [
+members = [ "individual_constraint_matching",
     "stress_zero",
 ]
 

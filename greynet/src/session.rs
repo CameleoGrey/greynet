@@ -1,16 +1,47 @@
-//session.rs
+// session.rs - Enhanced with per-fact constraint matching
+
 use crate::arena::{NodeArena, NodeData, NodeId, SafeTupleIndex, TupleArena};
 use crate::constraint::ConstraintWeights;
 use crate::scheduler::BatchScheduler;
 use crate::score::Score;
 use crate::state::TupleState;
-use crate::tuple::{AnyTuple, UniTuple};
+use crate::tuple::{AnyTuple, UniTuple, FactIterator};
 use crate::{GreynetFact, Result, GreynetError, ResourceLimits};
 use std::any::TypeId;
 use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::FxHashSet as HashSet;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::cell::RefCell;
+use uuid::Uuid;
+
+/// Information about a constraint violation involving a specific fact
+#[derive(Debug, Clone)]
+pub struct FactConstraintMatch {
+    pub constraint_id: String,
+    pub violating_tuple: AnyTuple,
+    pub fact_role: FactRole,
+}
+
+/// Describes the role of a fact within a violating tuple
+#[derive(Debug, Clone)]
+pub enum FactRole {
+    /// Fact is the only fact in a unary tuple
+    Primary,
+    /// Fact is at a specific position in a multi-fact tuple
+    Positional { index: usize, total_facts: usize },
+}
+
+/// Comprehensive constraint match information organized by fact
+#[derive(Debug, Clone)]
+pub struct FactConstraintReport {
+    /// Matches organized by fact ID
+    pub matches_by_fact: HashMap<Uuid, Vec<FactConstraintMatch>>,
+    /// Total number of unique facts involved in violations
+    pub total_involved_facts: usize,
+    /// Total number of constraint violations
+    pub total_violations: usize,
+}
 
 /// High-performance session with direct ownership and comprehensive error handling
 #[derive(Debug)]
@@ -170,6 +201,165 @@ impl<S: Score + 'static> Session<S> {
         }
 
         Ok(all_matches)
+    }
+
+    /// Get constraint matches for a specific fact by its ID
+    pub fn get_fact_constraint_matches(&mut self, fact_id: Uuid) -> Result<Vec<FactConstraintMatch>> {
+        self.flush()?;
+
+        let mut matches = Vec::new();
+
+        // Check each scoring node for matches involving this fact
+        for &node_id in &self.scoring_nodes {
+            if let Some(NodeData::Scoring(scoring_node)) = self.nodes.get_node(node_id) {
+                let constraint_id = scoring_node.constraint_id.clone();
+
+                // Check all active matches in this scoring node
+                for &tuple_idx in scoring_node.match_indices() {
+                    if let Ok(tuple) = self.tuples.get_tuple_checked(tuple_idx) {
+                        // Check if this tuple contains the specified fact
+                        if let Some(fact_role) = self.find_fact_in_tuple(tuple, fact_id) {
+                            matches.push(FactConstraintMatch {
+                                constraint_id: constraint_id.clone(),
+                                violating_tuple: tuple.clone(),
+                                fact_role,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(matches)
+    }
+
+    /// Get constraint matches for a specific fact by the fact itself
+    pub fn get_fact_constraint_matches_by_fact<T: GreynetFact>(&mut self, fact: &T) -> Result<Vec<FactConstraintMatch>> {
+        self.get_fact_constraint_matches(fact.fact_id())
+    }
+
+    /// Get all constraint matches organized by fact
+    pub fn get_all_fact_constraint_matches(&mut self) -> Result<FactConstraintReport> {
+        self.flush()?;
+
+        let mut matches_by_fact: HashMap<Uuid, Vec<FactConstraintMatch>> = HashMap::default();
+        let mut total_violations = 0;
+
+        // Iterate through all scoring nodes and their matches
+        for &node_id in &self.scoring_nodes {
+            if let Some(NodeData::Scoring(scoring_node)) = self.nodes.get_node(node_id) {
+                let constraint_id = scoring_node.constraint_id.clone();
+
+                for &tuple_idx in scoring_node.match_indices() {
+                    if let Ok(tuple) = self.tuples.get_tuple_checked(tuple_idx) {
+                        total_violations += 1;
+
+                        // Extract all facts from this violating tuple
+                        for (index, fact) in tuple.facts_iter().enumerate() {
+                            let fact_id = fact.fact_id();
+                            let fact_role = if tuple.arity() == 1 {
+                                FactRole::Primary
+                            } else {
+                                FactRole::Positional {
+                                    index,
+                                    total_facts: tuple.arity(),
+                                }
+                            };
+
+                            let match_info = FactConstraintMatch {
+                                constraint_id: constraint_id.clone(),
+                                violating_tuple: tuple.clone(),
+                                fact_role,
+                            };
+
+                            matches_by_fact
+                                .entry(fact_id)
+                                .or_insert_with(Vec::new)
+                                .push(match_info);
+                        }
+                    }
+                }
+            }
+        }
+
+        let total_involved_facts = matches_by_fact.len();
+
+        Ok(FactConstraintReport {
+            matches_by_fact,
+            total_involved_facts,
+            total_violations,
+        })
+    }
+
+    /// Get constraint matches for facts that were directly inserted into the system
+    pub fn get_inserted_fact_constraint_matches(&mut self) -> Result<HashMap<Uuid, Vec<FactConstraintMatch>>> {
+        self.flush()?;
+
+        let mut matches_by_fact: HashMap<Uuid, Vec<FactConstraintMatch>> = HashMap::default();
+
+        // Collect fact IDs to avoid borrowing `self` in the loop.
+        // This resolves the conflict where we immutably borrow `self.fact_to_tuple_map`
+        // while trying to mutably borrow `self` by calling `get_fact_constraint_matches`.
+        let fact_ids: Vec<Uuid> = self.fact_to_tuple_map.keys().copied().collect();
+
+        // Now iterate over the collected IDs. `self` is no longer borrowed.
+        for fact_id in fact_ids {
+            // This call requires `&mut self`, which is now safe.
+            let fact_matches = self.get_fact_constraint_matches(fact_id)?;
+            if !fact_matches.is_empty() {
+                matches_by_fact.insert(fact_id, fact_matches);
+            }
+        }
+
+        Ok(matches_by_fact)
+    }
+
+    /// Check if a specific fact is currently involved in any constraint violations
+    pub fn is_fact_violating_constraints(&mut self, fact_id: Uuid) -> Result<bool> {
+        let matches = self.get_fact_constraint_matches(fact_id)?;
+        Ok(!matches.is_empty())
+    }
+
+    /// Get the count of constraint violations involving a specific fact
+    pub fn get_fact_violation_count(&mut self, fact_id: Uuid) -> Result<usize> {
+        let matches = self.get_fact_constraint_matches(fact_id)?;
+        Ok(matches.len())
+    }
+
+    /// Get facts that are involved in the most constraint violations
+    pub fn get_most_problematic_facts(&mut self, limit: usize) -> Result<Vec<(Uuid, usize)>> {
+        let report = self.get_all_fact_constraint_matches()?;
+        
+        let mut fact_violation_counts: Vec<(Uuid, usize)> = report
+            .matches_by_fact
+            .into_iter()
+            .map(|(fact_id, matches)| (fact_id, matches.len()))
+            .collect();
+
+        // Sort by violation count (descending)
+        fact_violation_counts.sort_by(|a, b| b.1.cmp(&a.1));
+        
+        // Take only the requested number
+        fact_violation_counts.truncate(limit);
+        
+        Ok(fact_violation_counts)
+    }
+
+    /// Helper function to find a fact within a tuple and determine its role
+    fn find_fact_in_tuple(&self, tuple: &AnyTuple, target_fact_id: Uuid) -> Option<FactRole> {
+        for (index, fact) in tuple.facts_iter().enumerate() {
+            if fact.fact_id() == target_fact_id {
+                return Some(if tuple.arity() == 1 {
+                    FactRole::Primary
+                } else {
+                    FactRole::Positional {
+                        index,
+                        total_facts: tuple.arity(),
+                    }
+                });
+            }
+        }
+        None
     }
 
     pub fn retract_batch<'a, T: GreynetFact + 'a>(
