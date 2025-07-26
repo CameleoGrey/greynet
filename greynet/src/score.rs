@@ -1,12 +1,11 @@
-// score.rs - Score trait and implementations
 use std::fmt::Debug;
 use std::ops::Add;
 
-/// Core trait for all score types in the Greynet system.
-///
-/// Score types represent the evaluation result of constraints and must support
-/// addition (for combining multiple constraint scores) and comparison.
+/// Core trait for all score types with mandatory accumulation support
 pub trait Score: Clone + Add<Output = Self> + PartialOrd + Debug + 'static {
+    /// Accumulator type for efficient score building
+    type Accumulator: Default + Clone + Debug;
+    
     /// Returns a "null" or zero score (the additive identity)
     fn null_score() -> Self;
 
@@ -28,43 +27,35 @@ pub trait Score: Clone + Add<Output = Self> + PartialOrd + Debug + 'static {
     /// Multiplies the score by a scalar value
     fn mul(&self, scalar: f64) -> Self;
     
-    /// Calculates a fitness value, often used in genetic algorithms.
-    /// The formula transforms a score into a value typically between 0 and 1.
+    /// Calculates a fitness value, often used in genetic algorithms
     fn get_fitness_value(&self) -> f64;
 
-    /// Returns a "stub" or placeholder score, usually representing a very high
-    /// or infinite penalty.
+    /// Returns a "stub" or placeholder score, usually representing a very high penalty
     fn get_stub_score() -> Self;
 
-    /// Rounds the score's components to a given number of decimal places.
-    /// The `precision` slice should contain the number of decimal places for each component.
+    /// Rounds the score's components to a given number of decimal places
     fn round(&mut self, precision: &[i32]);
+    
+    // === NEW ACCUMULATION METHODS ===
+    
+    /// Add a score to the accumulator
+    fn accumulate_into(accumulator: &mut Self::Accumulator, score: &Self);
+    
+    /// Build final score from accumulator
+    fn from_accumulator(accumulator: &Self::Accumulator) -> Self;
+    
+    /// Reset the accumulator to zero state
+    fn reset_accumulator(accumulator: &mut Self::Accumulator);
+    
+    /// Create a new accumulator with this score as initial value
+    fn into_accumulator(&self) -> Self::Accumulator {
+        let mut acc = Self::Accumulator::default();
+        Self::accumulate_into(&mut acc, self);
+        acc
+    }
 }
 
-// --- Ergonomic Score Construction Traits ---
-
-/// A trait for scores that can be constructed from a single "simple" value.
-pub trait FromSimple: Sized {
-    fn simple(value: f64) -> Self;
-}
-
-/// A trait for scores that can be constructed from a "hard" value.
-pub trait FromHard: Sized {
-    fn hard(value: f64) -> Self;
-}
-
-/// A trait for scores that can be constructed from a "medium" value.
-pub trait FromMedium: Sized {
-    fn medium(value: f64) -> Self;
-}
-
-/// A trait for scores that can be constructed from a "soft" value.
-pub trait FromSoft: Sized {
-    fn soft(value: f64) -> Self;
-}
-
-
-/// A simple score with a single numeric value
+/// SimpleScore with primitive accumulator
 #[derive(Clone, Debug, PartialEq, PartialOrd)]
 pub struct SimpleScore {
     pub simple_value: f64,
@@ -87,6 +78,8 @@ impl Add for SimpleScore {
 }
 
 impl Score for SimpleScore {
+    type Accumulator = f64;
+
     fn null_score() -> Self {
         SimpleScore { simple_value: 0.0 }
     }
@@ -133,47 +126,49 @@ impl Score for SimpleScore {
             self.simple_value = (self.simple_value * factor).round() / factor;
         }
     }
-}
 
-impl From<f64> for SimpleScore {
-    fn from(value: f64) -> Self {
-        SimpleScore::new(value)
+    // === ACCUMULATION METHODS ===
+    
+    #[inline]
+    fn accumulate_into(accumulator: &mut Self::Accumulator, score: &Self) {
+        *accumulator += score.simple_value;
+    }
+    
+    #[inline]
+    fn from_accumulator(accumulator: &Self::Accumulator) -> Self {
+        SimpleScore { simple_value: *accumulator }
+    }
+    
+    #[inline]
+    fn reset_accumulator(accumulator: &mut Self::Accumulator) {
+        *accumulator = 0.0;
     }
 }
 
-impl FromSimple for SimpleScore {
-    fn simple(value: f64) -> Self {
-        Self::new(value)
-    }
-}
-
-/// A score with separate hard and soft components
+/// HardSoftScore with structured accumulator
 #[derive(Clone, Debug, PartialEq, PartialOrd)]
 pub struct HardSoftScore {
     pub hard_score: f64,
     pub soft_score: f64,
 }
 
+#[derive(Default, Clone, Debug)]
+pub struct HardSoftAccumulator {
+    pub hard_total: f64,
+    pub soft_total: f64,
+}
+
 impl HardSoftScore {
     pub fn new(hard_score: f64, soft_score: f64) -> Self {
-        Self {
-            hard_score,
-            soft_score,
-        }
+        Self { hard_score, soft_score }
     }
 
     pub fn hard(hard_score: f64) -> Self {
-        Self {
-            hard_score,
-            soft_score: 0.0,
-        }
+        Self { hard_score, soft_score: 0.0 }
     }
 
     pub fn soft(soft_score: f64) -> Self {
-        Self {
-            hard_score: 0.0,
-            soft_score,
-        }
+        Self { hard_score: 0.0, soft_score }
     }
 }
 
@@ -189,11 +184,10 @@ impl Add for HardSoftScore {
 }
 
 impl Score for HardSoftScore {
+    type Accumulator = HardSoftAccumulator;
+
     fn null_score() -> Self {
-        HardSoftScore {
-            hard_score: 0.0,
-            soft_score: 0.0,
-        }
+        HardSoftScore { hard_score: 0.0, soft_score: 0.0 }
     }
 
     fn get_fields() -> &'static [&'static str] {
@@ -252,21 +246,31 @@ impl Score for HardSoftScore {
             self.soft_score = (self.soft_score * p_soft).round() / p_soft;
         }
     }
-}
 
-impl FromHard for HardSoftScore {
-    fn hard(value: f64) -> Self {
-        Self::hard(value)
+    // === ACCUMULATION METHODS ===
+    
+    #[inline]
+    fn accumulate_into(accumulator: &mut Self::Accumulator, score: &Self) {
+        accumulator.hard_total += score.hard_score;
+        accumulator.soft_total += score.soft_score;
+    }
+    
+    #[inline]
+    fn from_accumulator(accumulator: &Self::Accumulator) -> Self {
+        HardSoftScore {
+            hard_score: accumulator.hard_total,
+            soft_score: accumulator.soft_total,
+        }
+    }
+    
+    #[inline]
+    fn reset_accumulator(accumulator: &mut Self::Accumulator) {
+        accumulator.hard_total = 0.0;
+        accumulator.soft_total = 0.0;
     }
 }
 
-impl FromSoft for HardSoftScore {
-    fn soft(value: f64) -> Self {
-        Self::soft(value)
-    }
-}
-
-/// A score with hard, medium, and soft components
+/// HardMediumSoftScore with structured accumulator
 #[derive(Clone, Debug, PartialEq, PartialOrd)]
 pub struct HardMediumSoftScore {
     pub hard_score: f64,
@@ -274,37 +278,28 @@ pub struct HardMediumSoftScore {
     pub soft_score: f64,
 }
 
+#[derive(Default, Clone, Debug)]
+pub struct HardMediumSoftAccumulator {
+    pub hard_total: f64,
+    pub medium_total: f64,
+    pub soft_total: f64,
+}
+
 impl HardMediumSoftScore {
     pub fn new(hard_score: f64, medium_score: f64, soft_score: f64) -> Self {
-        Self {
-            hard_score,
-            medium_score,
-            soft_score,
-        }
+        Self { hard_score, medium_score, soft_score }
     }
 
     pub fn hard(hard_score: f64) -> Self {
-        Self {
-            hard_score,
-            medium_score: 0.0,
-            soft_score: 0.0,
-        }
+        Self { hard_score, medium_score: 0.0, soft_score: 0.0 }
     }
 
     pub fn medium(medium_score: f64) -> Self {
-        Self {
-            hard_score: 0.0,
-            medium_score,
-            soft_score: 0.0,
-        }
+        Self { hard_score: 0.0, medium_score, soft_score: 0.0 }
     }
 
     pub fn soft(soft_score: f64) -> Self {
-        Self {
-            hard_score: 0.0,
-            medium_score: 0.0,
-            soft_score,
-        }
+        Self { hard_score: 0.0, medium_score: 0.0, soft_score }
     }
 }
 
@@ -321,6 +316,8 @@ impl Add for HardMediumSoftScore {
 }
 
 impl Score for HardMediumSoftScore {
+    type Accumulator = HardMediumSoftAccumulator;
+
     fn null_score() -> Self {
         HardMediumSoftScore {
             hard_score: 0.0,
@@ -395,6 +392,66 @@ impl Score for HardMediumSoftScore {
             self.soft_score = (self.soft_score * p_soft).round() / p_soft;
         }
     }
+
+    // === ACCUMULATION METHODS ===
+    
+    #[inline]
+    fn accumulate_into(accumulator: &mut Self::Accumulator, score: &Self) {
+        accumulator.hard_total += score.hard_score;
+        accumulator.medium_total += score.medium_score;
+        accumulator.soft_total += score.soft_score;
+    }
+    
+    #[inline]
+    fn from_accumulator(accumulator: &Self::Accumulator) -> Self {
+        HardMediumSoftScore {
+            hard_score: accumulator.hard_total,
+            medium_score: accumulator.medium_total,
+            soft_score: accumulator.soft_total,
+        }
+    }
+    
+    #[inline]
+    fn reset_accumulator(accumulator: &mut Self::Accumulator) {
+        accumulator.hard_total = 0.0;
+        accumulator.medium_total = 0.0;
+        accumulator.soft_total = 0.0;
+    }
+}
+
+// Keep the trait implementations for ergonomic construction
+pub trait FromSimple: Sized {
+    fn simple(value: f64) -> Self;
+}
+
+pub trait FromHard: Sized {
+    fn hard(value: f64) -> Self;
+}
+
+pub trait FromMedium: Sized {
+    fn medium(value: f64) -> Self;
+}
+
+pub trait FromSoft: Sized {
+    fn soft(value: f64) -> Self;
+}
+
+impl FromSimple for SimpleScore {
+    fn simple(value: f64) -> Self {
+        Self::new(value)
+    }
+}
+
+impl FromHard for HardSoftScore {
+    fn hard(value: f64) -> Self {
+        Self::hard(value)
+    }
+}
+
+impl FromSoft for HardSoftScore {
+    fn soft(value: f64) -> Self {
+        Self::soft(value)
+    }
 }
 
 impl FromHard for HardMediumSoftScore {
@@ -415,3 +472,8 @@ impl FromSoft for HardMediumSoftScore {
     }
 }
 
+impl From<f64> for SimpleScore {
+    fn from(value: f64) -> Self {
+        SimpleScore::new(value)
+    }
+}

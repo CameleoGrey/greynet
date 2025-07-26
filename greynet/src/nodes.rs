@@ -757,11 +757,16 @@ impl std::fmt::Debug for FlatMapNode {
 }
 
 
+/// Ultra-high-performance scoring node with direct accumulation
 pub struct ScoringNode<S: Score> {
     pub constraint_id: String,
     pub penalty_function: ImpactFn<S>,
     pub weights: Rc<RefCell<ConstraintWeights>>,
-    pub matches: HashMap<SafeTupleIndex, S>,
+    // OPTIMIZATION: Direct primitive accumulation instead of HashMap
+    score_accumulator: S::Accumulator,
+    match_count: usize,
+    // Lightweight tracking for debugging/analysis only
+    active_matches: rustc_hash::FxHashSet<SafeTupleIndex>,
 }
 
 impl<S: Score> ScoringNode<S> {
@@ -774,10 +779,13 @@ impl<S: Score> ScoringNode<S> {
             constraint_id,
             penalty_function,
             weights,
-            matches: HashMap::default(),
+            score_accumulator: S::Accumulator::default(),
+            match_count: 0,
+            active_matches: rustc_hash::FxHashSet::default(),
         }
     }
 
+    /// Ultra-fast insert with O(1) accumulation
     #[inline]
     pub fn insert_collect_ops(
         &mut self,
@@ -786,57 +794,131 @@ impl<S: Score> ScoringNode<S> {
         _operations: &mut Vec<NodeOperation>,
     ) -> Result<()> {
         if let Ok(tuple) = tuples.get_tuple_checked(tuple_index) {
-            let base_score = self.penalty_function.execute(tuple);
-            let weight = self.weights.borrow().get_weight(&self.constraint_id);
-            let weighted_score = base_score.mul(weight);
-            self.matches.insert(tuple_index, weighted_score);
-        }
-        Ok(())
-    }
-
-    #[inline]
-    pub fn retract_collect_ops(
-        &mut self,
-        tuple_index: SafeTupleIndex,
-        _tuples: &mut TupleArena,
-        _operations: &mut Vec<NodeOperation>,
-    ) -> Result<()> {
-        self.matches.remove(&tuple_index);
-        Ok(())
-    }
-
-    #[inline]
-    pub fn get_total_score(&self) -> S {
-        self.matches
-            .values()
-            .fold(S::null_score(), |acc, score| acc + score.clone())
-    }
-
-    pub fn recalculate_scores(&mut self, tuples: &TupleArena) -> Result<()> {
-        let weight = self.weights.borrow().get_weight(&self.constraint_id);
-        for (tuple_idx, score_val) in self.matches.iter_mut() {
-            if let Ok(tuple) = tuples.get_tuple_checked(*tuple_idx) {
+            // Ensure we don't double-count
+            if self.active_matches.insert(tuple_index) {
                 let base_score = self.penalty_function.execute(tuple);
-                *score_val = base_score.mul(weight);
+                let weight = self.weights.borrow().get_weight(&self.constraint_id);
+                let weighted_score = base_score.mul(weight);
+                
+                // Direct O(1) accumulation - no HashMap overhead!
+                S::accumulate_into(&mut self.score_accumulator, &weighted_score);
+                self.match_count += 1;
             }
         }
         Ok(())
     }
 
+    /// Ultra-fast retract with O(1) subtraction
+    #[inline]
+    pub fn retract_collect_ops(
+        &mut self,
+        tuple_index: SafeTupleIndex,
+        tuples: &mut TupleArena,
+        _operations: &mut Vec<NodeOperation>,
+    ) -> Result<()> {
+        // Only process if tuple was actually a match
+        if self.active_matches.remove(&tuple_index) {
+            if let Ok(tuple) = tuples.get_tuple_checked(tuple_index) {
+                let base_score = self.penalty_function.execute(tuple);
+                let weight = self.weights.borrow().get_weight(&self.constraint_id);
+                let weighted_score = base_score.mul(weight);
+                
+                // Subtract by adding negative score - still O(1)!
+                let negative_score = weighted_score.mul(-1.0);
+                S::accumulate_into(&mut self.score_accumulator, &negative_score);
+                self.match_count = self.match_count.saturating_sub(1);
+            }
+        }
+        Ok(())
+    }
+
+    /// Blazing fast total score - no iteration needed!
+    #[inline]
+    pub fn get_total_score(&self) -> S {
+        S::from_accumulator(&self.score_accumulator)
+    }
+
+    /// Optimized bulk recalculation
+    pub fn recalculate_scores(&mut self, tuples: &TupleArena) -> Result<()> {
+        // Reset accumulator to zero
+        S::reset_accumulator(&mut self.score_accumulator);
+        self.match_count = 0;
+        
+        let weight = self.weights.borrow().get_weight(&self.constraint_id);
+        
+        // Rebuild accumulator efficiently
+        for &tuple_idx in &self.active_matches {
+            if let Ok(tuple) = tuples.get_tuple_checked(tuple_idx) {
+                let base_score = self.penalty_function.execute(tuple);
+                let weighted_score = base_score.mul(weight);
+                S::accumulate_into(&mut self.score_accumulator, &weighted_score);
+                self.match_count += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Bulk recalculation - same performance as regular
+    #[inline]
     pub fn recalculate_scores_bulk(&mut self, tuples: &TupleArena) -> Result<()> {
         self.recalculate_scores(tuples)
     }
 
-    pub fn match_indices(&self) -> impl Iterator<Item = &SafeTupleIndex> {
-        self.matches.keys()
+    /// Fast accessors
+    #[inline]
+    pub fn match_count(&self) -> usize {
+        self.match_count
     }
+
+    #[inline]
+    pub fn has_matches(&self) -> bool {
+        self.match_count > 0
+    }
+
+    #[inline]
+    pub fn has_match(&self, tuple_index: &SafeTupleIndex) -> bool {
+        self.active_matches.contains(tuple_index)
+    }
+
+    /// Get match indices iterator (for debugging/analysis)
+    pub fn match_indices(&self) -> impl Iterator<Item = &SafeTupleIndex> {
+        self.active_matches.iter()
+    }
+    
+    /// Get current accumulator state (for debugging)
+    pub fn get_accumulator(&self) -> &S::Accumulator {
+        &self.score_accumulator
+    }
+    
+    /// Memory usage estimate
+    pub fn memory_usage_estimate(&self) -> usize {
+        std::mem::size_of::<Self>() + 
+        self.active_matches.capacity() * std::mem::size_of::<SafeTupleIndex>()
+    }
+    
+    /// Performance statistics
+    pub fn get_performance_stats(&self) -> ScoringNodeStats {
+        ScoringNodeStats {
+            match_count: self.match_count,
+            memory_usage: self.memory_usage_estimate(),
+            accumulator_size: std::mem::size_of::<S::Accumulator>(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ScoringNodeStats {
+    pub match_count: usize,
+    pub memory_usage: usize,
+    pub accumulator_size: usize,
 }
 
 impl<S: Score> std::fmt::Debug for ScoringNode<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ScoringNode")
             .field("constraint_id", &self.constraint_id)
-            .field("matches", &self.matches.len())
+            .field("match_count", &self.match_count)
+            .field("accumulator", &self.score_accumulator)
             .field("penalty_function", &"<function>")
             .finish()
     }

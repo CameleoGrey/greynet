@@ -247,15 +247,18 @@ impl<S: Score + 'static> Session<S> {
 
     pub fn get_score(&mut self) -> Result<S> {
         self.flush()?;
-
-        let total_score = self.scoring_nodes.iter().fold(S::null_score(), |acc, &node_id| {
+        
+        let mut total_accumulator = S::Accumulator::default();
+        
+        // Accumulate scores from all scoring nodes - no iteration overhead!
+        for &node_id in &self.scoring_nodes {
             if let Some(NodeData::Scoring(scoring_node)) = self.nodes.get_node(node_id) {
-                acc + scoring_node.get_total_score()
-            } else {
-                acc
+                let node_score = scoring_node.get_total_score();
+                S::accumulate_into(&mut total_accumulator, &node_score);
             }
-        });
-        Ok(total_score)
+        }
+        
+        Ok(S::from_accumulator(&total_accumulator))
     }
 
     pub fn bulk_transition_tuple_states(&mut self, from: TupleState, to: TupleState) -> Result<usize> {
