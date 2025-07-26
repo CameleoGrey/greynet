@@ -1,3 +1,4 @@
+//lib.rs
 // lib.rs - Main library file
 //!
 //! This crate implements the core foundation types for the Greynet constraint
@@ -30,7 +31,6 @@ pub mod utils;
 pub mod sparse_set;
 pub mod packed_indices;
 pub mod common_ops;
-pub mod streams_zero_copy;
 
 pub use error::{GreynetError, Result};
 pub use fact::GreynetFact;
@@ -45,7 +45,7 @@ pub use utils::TupleUtils;
 pub use session::Session;
 pub use constraint_builder::ConstraintBuilder;
 pub use constraint::ConstraintWeights;
-pub use stream_def::{Stream, Arity1, Arity2, Arity3, Arity4, Arity5, ConstraintRecipe};
+pub use stream_def::{Stream, Arity1, Arity2, Arity3, Arity4, Arity5, ConstraintRecipe, extract_fact};
 pub use collectors::{BaseCollector, Collectors};
 pub use analysis::{ConstraintAnalysis, ConstraintViolationReport, NetworkStatistics};
 
@@ -111,29 +111,17 @@ pub fn builder_with_limits<S: Score + 'static>(limits: ResourceLimits) -> Constr
     ConstraintBuilder::with_limits(limits)
 }
 
-
 /// Performance-optimized prelude for common imports
 pub mod prelude {
     pub use crate::{
         GreynetFact, Score, SimpleScore, HardSoftScore, HardMediumSoftScore,
         AnyTuple, TupleState, Session, ConstraintBuilder, Stream,
         Arity1, Arity2, JoinerType, Collectors, builder, builder_with_limits,
-        Result, GreynetError, ResourceLimits, ConstraintRecipe
+        Result, GreynetError, ResourceLimits, ConstraintRecipe, extract_fact
     };
     
     // Tuple zero-copy traits
     pub use crate::tuple::ZeroCopyFacts;
     
     pub use std::rc::Rc;
-}
-
-// Enhanced convenience functions
-/// Create a zero-copy optimized constraint builder
-pub fn zero_copy_builder<S: Score + 'static>() -> ConstraintBuilder<S> {
-    ConstraintBuilder::new()
-}
-
-/// Create a zero-copy optimized constraint builder with custom limits
-pub fn zero_copy_builder_with_limits<S: Score + 'static>(limits: ResourceLimits) -> ConstraintBuilder<S> {
-    ConstraintBuilder::with_limits(limits)
 }

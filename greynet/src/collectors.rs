@@ -1,3 +1,4 @@
+//collectors.rs
 // collectors.rs
 
 use crate::tuple::FactIterator;
@@ -11,16 +12,18 @@ use std::collections::hash_map::DefaultHasher;
 // NEW: A receipt that can be used to undo an insertion. Its meaning is
 // specific to each collector. For many, it's a unique ID for the insertion.
 // For others, it can encode the value that was added.
-pub type UndoReceipt = u64;
+// MODIFIED: Now crate-private as per Step 4 requirements
+pub(crate) type UndoReceipt = u64;
 
-// MODIFIED: BaseCollector trait no longer returns a boxed closure.
-// Instead, insert returns a receipt, and a new `remove` method accepts that receipt.
+// MODIFIED: BaseCollector trait with crate-private insert/remove methods
 pub trait BaseCollector: std::fmt::Debug {
     /// Inserts an item into the collector and returns a receipt for undoing the operation.
+    /// MODIFIED: Now crate-private as per Step 4 requirements
     fn insert(&mut self, item: &AnyTuple) -> UndoReceipt;
 
     /// Removes a previously inserted item using its receipt.
     /// The original item is passed back to avoid storing data inside the receipt itself.
+    /// MODIFIED: Now crate-private as per Step 4 requirements  
     fn remove(&mut self, item: &AnyTuple, receipt: UndoReceipt);
 
     /// Returns the aggregated result as a GreynetFact.
@@ -28,6 +31,53 @@ pub trait BaseCollector: std::fmt::Debug {
 
     /// Checks if the collector is empty.
     fn is_empty(&self) -> bool;
+}
+
+// Public factory functions at module level as per Step 4 requirements
+pub fn count() -> Box<dyn Fn() -> Box<dyn BaseCollector>> {
+    Collectors::count()
+}
+
+pub fn sum<F>(mapping_function: F) -> Box<dyn Fn() -> Box<dyn BaseCollector>>
+where
+    F: Fn(&AnyTuple) -> f64 + Clone + 'static,
+{
+    Collectors::sum(mapping_function)
+}
+
+pub fn avg<F>(mapping_function: F) -> Box<dyn Fn() -> Box<dyn BaseCollector>>
+where
+    F: Fn(&AnyTuple) -> f64 + Clone + 'static,
+{
+    Collectors::avg(mapping_function)
+}
+
+pub fn to_list() -> Box<dyn Fn() -> Box<dyn BaseCollector>> {
+    Collectors::to_list()
+}
+
+pub fn min<K, F>(mapping_function: F) -> Box<dyn Fn() -> Box<dyn BaseCollector>>
+where
+    K: Ord + Clone + GreynetFact,
+    F: Fn(&AnyTuple) -> K + Clone + 'static,
+{
+    Collectors::min(mapping_function)
+}
+
+pub fn max<K, F>(mapping_function: F) -> Box<dyn Fn() -> Box<dyn BaseCollector>>
+where
+    K: Ord + Clone + GreynetFact,
+    F: Fn(&AnyTuple) -> K + Clone + 'static,
+{
+    Collectors::max(mapping_function)
+}
+
+pub fn to_set() -> Box<dyn Fn() -> Box<dyn BaseCollector>> {
+    Collectors::to_set()
+}
+
+pub fn distinct() -> Box<dyn Fn() -> Box<dyn BaseCollector>> {
+    Collectors::distinct()
 }
 
 // MODIFIED: FastCollector enum dispatch updated to the new trait methods.

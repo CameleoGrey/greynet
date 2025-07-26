@@ -1,20 +1,14 @@
 use greynet::prelude::*;
-// Import zero-copy API
-use greynet::streams_zero_copy::{ZeroCopyJoinOps, ZeroCopyStreamOps, enhanced_zero_copy_ops};
-use greynet::streams_zero_copy::zero_copy_ops;
-use greynet::tuple::ZeroCopyFacts;
-use greynet::nodes::{ZeroCopyImpactFn, ZeroCopyKeyFn, ZeroCopyPredicate};
-use greynet::{Collectors, JoinerType};
+use greynet::tuple::{AnyTuple, ZeroCopyFacts}; // Import necessary tuple traits
+use greynet::{Collectors};
+use std::any::Any;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::time::Instant;
-use std::rc::Rc;
-use std::any::Any;
 use uuid::Uuid;
 use rand::prelude::*;
-use greynet::zero_copy_builder_with_limits;
 
-// --- Fact Definitions ---
+// --- Fact Definitions (Unchanged) ---
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct Customer {
@@ -36,12 +30,18 @@ pub enum CustomerStatus {
     Inactive,
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)] // Removed Hash and Eq from derive
 pub struct Transaction {
     pub id: i32,
     pub customer_id: i32,
-    pub amount: i64, // Amount in cents
+    pub amount: f64, // Amount in dollars
     pub location: String,
+}
+
+impl Transaction {
+    pub fn print_amount(&self) {
+        println!("{}", self.amount);
+    }
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -50,7 +50,20 @@ pub struct SecurityAlert {
     pub severity: i32,
 }
 
-// --- GreynetFact Implementations ---
+// --- Manual Implementations for Transaction due to f64 ---
+
+impl Hash for Transaction {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+        self.customer_id.hash(state);
+        self.amount.to_bits().hash(state); // Hash the bit representation of f64
+        self.location.hash(state);
+    }
+}
+
+impl Eq for Transaction {} // Marker trait
+
+// --- GreynetFact Implementations (Unchanged for Customer, SecurityAlert) ---
 
 impl GreynetFact for Customer {
     fn fact_id(&self) -> Uuid {
@@ -83,7 +96,7 @@ impl GreynetFact for Customer {
 impl GreynetFact for Transaction {
     fn fact_id(&self) -> Uuid {
         let mut hasher = DefaultHasher::new();
-        self.hash(&mut hasher);
+        self.hash(&mut hasher); // Uses the manual Hash impl
         let hash_val = hasher.finish();
         let namespace = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
         Uuid::new_v5(&namespace, &hash_val.to_be_bytes())
@@ -94,12 +107,12 @@ impl GreynetFact for Transaction {
     }
 
     fn eq_fact(&self, other: &dyn GreynetFact) -> bool {
-        other.as_any().downcast_ref::<Transaction>().map_or(false, |t| t == self)
+        other.as_any().downcast_ref::<Transaction>().map_or(false, |t| self == t)
     }
 
     fn hash_fact(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
-        self.hash(&mut hasher);
+        self.hash(&mut hasher); // Uses the manual Hash impl
         hasher.finish()
     }
 
@@ -136,125 +149,11 @@ impl GreynetFact for SecurityAlert {
     }
 }
 
-// --- Pure Zero-Copy Operations ---
 
-/// Zero-copy key extractor for Transaction customer_id
-fn transaction_customer_key() -> ZeroCopyKeyFn {
-    zero_copy_ops::field_key(|tx: &Transaction| tx.customer_id)
-}
+// --- Modern API Constraint Definitions ---
 
-/// Zero-copy key extractor for Customer id
-fn customer_id_key() -> ZeroCopyKeyFn {
-    zero_copy_ops::field_key(|c: &Customer| c.id)
-}
-
-/// Zero-copy key extractor for location (Transaction)
-fn transaction_location_key() -> ZeroCopyKeyFn {
-    Rc::new(|tuple: &dyn ZeroCopyFacts| {
-        tuple.first_fact()
-            .and_then(|fact| fact.as_any().downcast_ref::<Transaction>())
-            .map(|tx| {
-                let mut hasher = DefaultHasher::new();
-                tx.location.hash(&mut hasher);
-                hasher.finish()
-            })
-            .unwrap_or(0)
-    })
-}
-
-/// Zero-copy key extractor for location (SecurityAlert)
-fn alert_location_key() -> ZeroCopyKeyFn {
-    Rc::new(|tuple: &dyn ZeroCopyFacts| {
-        tuple.first_fact()
-            .and_then(|fact| fact.as_any().downcast_ref::<SecurityAlert>())
-            .map(|alert| {
-                let mut hasher = DefaultHasher::new();
-                alert.location.hash(&mut hasher);
-                hasher.finish()
-            })
-            .unwrap_or(0)
-    })
-}
-
-/// Zero-copy key extractor for location from BiTuple (Customer, Transaction)
-fn bituple_transaction_location_key() -> ZeroCopyKeyFn {
-    Rc::new(|tuple: &dyn ZeroCopyFacts| {
-        tuple.get_fact_ref(1) // Get Transaction from BiTuple
-            .and_then(|fact| fact.as_any().downcast_ref::<Transaction>())
-            .map(|tx| {
-                let mut hasher = DefaultHasher::new();
-                tx.location.hash(&mut hasher);
-                hasher.finish()
-            })
-            .unwrap_or(0)
-    })
-}
-
-/// Zero-copy predicate for high-value transactions
-fn high_value_transaction_predicate() -> ZeroCopyPredicate {
-    zero_copy_ops::field_check(|tx: &Transaction| tx.amount > 4_500_000)
-}
-
-/// Zero-copy predicate for inactive customers
-fn inactive_customer_predicate() -> ZeroCopyPredicate {
-    zero_copy_ops::field_check(|c: &Customer| matches!(c.status, CustomerStatus::Inactive))
-}
-
-/// Zero-copy predicate for high-risk customers
-fn high_risk_customer_predicate() -> ZeroCopyPredicate {
-    zero_copy_ops::field_check(|c: &Customer| matches!(c.risk_level, RiskLevel::High))
-}
-
-/// Zero-copy predicate for excessive transaction count
-fn excessive_transaction_count_predicate() -> ZeroCopyPredicate {
-    Rc::new(|tuple: &dyn ZeroCopyFacts| {
-        tuple.get_fact_ref(1) // Count is the second fact in BiTuple
-            .and_then(|fact| fact.as_any().downcast_ref::<usize>())
-            .map_or(false, |count| *count > 25)
-    })
-}
-
-/// Zero-copy impact function for high-value transactions
-fn high_value_transaction_impact() -> ZeroCopyImpactFn<SimpleScore> {
-    enhanced_zero_copy_ops::impact_function(|tuple: &dyn ZeroCopyFacts| {
-        tuple.first_fact()
-            .and_then(|fact| fact.as_any().downcast_ref::<Transaction>())
-            .map(|tx| SimpleScore::new(tx.amount as f64 / 100_000.0))
-            .unwrap_or_else(|| SimpleScore::new(0.0))
-    })
-}
-
-/// Zero-copy impact function for excessive transactions
-fn excessive_transactions_impact() -> ZeroCopyImpactFn<SimpleScore> {
-    enhanced_zero_copy_ops::impact_function(|tuple: &dyn ZeroCopyFacts| {
-        tuple.get_fact_ref(1)
-            .and_then(|fact| fact.as_any().downcast_ref::<usize>())
-            .map(|count| SimpleScore::new((*count as f64 - 25.0) * 10.0))
-            .unwrap_or_else(|| SimpleScore::new(0.0))
-    })
-}
-
-/// Zero-copy impact function for transactions in alerted locations
-fn alerted_location_impact() -> ZeroCopyImpactFn<SimpleScore> {
-    enhanced_zero_copy_ops::impact_function(|tuple: &dyn ZeroCopyFacts| {
-        tuple.get_fact_ref(1) // SecurityAlert is the second fact
-            .and_then(|fact| fact.as_any().downcast_ref::<SecurityAlert>())
-            .map(|alert| SimpleScore::new(100.0 * alert.severity as f64))
-            .unwrap_or_else(|| SimpleScore::new(0.0))
-    })
-}
-
-/// Zero-copy impact function for fixed penalties
-fn fixed_penalty_impact(penalty: f64) -> ZeroCopyImpactFn<SimpleScore> {
-    enhanced_zero_copy_ops::impact_function(move |_tuple: &dyn ZeroCopyFacts| {
-        SimpleScore::new(penalty)
-    })
-}
-
-// --- Pure Zero-Copy Constraint Definitions ---
-
-fn build_constraints_with_zero_copy() -> Result<Session<SimpleScore>> {
-    // Setup with optimized limits for zero-copy operations
+fn build_constraints() -> Result<Session<SimpleScore>> {
+    // Setup with optimized limits
     let limits = ResourceLimits {
         max_tuples: 50_000_000,
         max_operations_per_batch: 50_000_000,
@@ -263,84 +162,95 @@ fn build_constraints_with_zero_copy() -> Result<Session<SimpleScore>> {
         max_facts_per_type: 20_000_000,
     };
     
-    let builder = zero_copy_builder_with_limits::<SimpleScore>(limits);
+    // Use the modern builder from the prelude
+    let mut builder = builder_with_limits::<SimpleScore>(limits);
 
-    // Constraint 1: High-value transactions using pure zero-copy API
-    let high_value_constraint = builder
+    // Constraint 1: Penalize high-value transactions.
+    builder.add_constraint("high_value_transaction", 1.0)
         .for_each::<Transaction>()
-        .filter_zero_copy(high_value_transaction_predicate())
-        .penalize_zero_copy("high_value_transaction", high_value_transaction_impact());
+        .filter(|tx: &Transaction| tx.amount > 45000.0)
+        .penalize("high_value_transaction", |tuple: &AnyTuple| {
+            let tx = extract_fact::<Transaction>(tuple, 0).unwrap();
+            //tx.print_amount();
+            SimpleScore::new(tx.amount / 1000.0)
+        });
 
-    // Constraint 2: Excessive transactions per customer using zero-copy grouping
-    let excessive_transactions_constraint = builder
+    // Constraint 2: Penalize customers with an excessive number of transactions.
+    builder.add_constraint("excessive_transactions_per_customer", 1.0)
         .for_each::<Transaction>()
-        .group_by_zero_copy(
-            transaction_customer_key(),
-            Collectors::count(),
+        .group_by(
+            |tx: &Transaction| tx.customer_id, // Group transactions by customer
+            Collectors::count(),                // Count transactions in each group
         )
-        .filter_zero_copy(excessive_transaction_count_predicate())
-        .penalize_zero_copy("excessive_transactions_per_customer", excessive_transactions_impact());
+        .filter_tuple(|tuple: &dyn ZeroCopyFacts| {
+            extract_fact::<usize>(tuple, 1)
+                 .map_or(false, |count| *count > 25)
+        })
+        .penalize("excessive_transactions_per_customer", |tuple: &AnyTuple| {
+            // The tuple is a BiTuple<(u64_key, usize_count)>.
+            let count = extract_fact::<usize>(tuple, 1).unwrap();
+            SimpleScore::new((*count as f64 - 25.0) * 10.0)
+        });
 
-    // Constraint 3: Transactions in alerted locations using zero-copy joins
-    let alerted_location_constraint = builder
+    // Create reusable streams for joins. `builder.for_each()` is non-consuming.
+    let tx_stream = builder.for_each::<Transaction>();
+    let alerts_stream = builder.for_each::<SecurityAlert>();
+
+    // Constraint 3: Penalize transactions occurring in locations with security alerts.
+    builder.add_constraint("transaction_in_alerted_location", 1.0)
         .for_each::<Transaction>()
-        .join_zero_copy(
-            builder.for_each::<SecurityAlert>(),
-            JoinerType::Equal,
-            transaction_location_key(),
-            alert_location_key(),
+        .join_on(
+            alerts_stream.clone(), // Clone the stream definition for reuse
+            |tx: &Transaction| tx.location.clone(),
+            |alert: &SecurityAlert| alert.location.clone(),
         )
-        .penalize_zero_copy("transaction_in_alerted_location", alerted_location_impact());
+        .penalize("transaction_in_alerted_location", |tuple: &AnyTuple| {
+            // The tuple is a BiTuple<(Transaction, SecurityAlert)>.
+            let alert = extract_fact::<SecurityAlert>(tuple, 1).unwrap();
+            SimpleScore::new(100.0 * alert.severity as f64)
+        });
 
-    // Constraint 4: Inactive customer transactions using zero-copy filter chains
-    let inactive_customer_constraint = builder
+    // Constraint 4: Penalize transactions made by inactive customers.
+    builder.add_constraint("inactive_customer_transaction", 1.0)
         .for_each::<Customer>()
-        .filter_zero_copy(inactive_customer_predicate())
-        .join_zero_copy(
-            builder.for_each::<Transaction>(),
-            JoinerType::Equal,
-            customer_id_key(),
-            transaction_customer_key(),
+        .filter(|c: &Customer| matches!(c.status, CustomerStatus::Inactive))
+        .join_on(
+            tx_stream.clone(),
+            |c: &Customer| c.id,
+            |tx: &Transaction| tx.customer_id,
         )
-        .penalize_zero_copy("inactive_customer_transaction", fixed_penalty_impact(500.0));
+        .penalize("inactive_customer_transaction", |_| SimpleScore::new(500.0));
 
-    // Constraint 5: High-risk transactions without alerts using zero-copy conditional joins
-    let high_risk_no_alert_constraint = builder
+    // Constraint 5: Penalize transactions from high-risk customers in locations *without* alerts.
+    builder.add_constraint("high_risk_transaction_without_alert", 1.0)
         .for_each::<Customer>()
-        .filter_zero_copy(high_risk_customer_predicate())
-        .join_zero_copy(
-            builder.for_each::<Transaction>(),
-            JoinerType::Equal,
-            customer_id_key(),
-            transaction_customer_key(),
+        .filter(|c: &Customer| matches!(c.risk_level, RiskLevel::High))
+        .join_on(
+            tx_stream.clone(), // Reuse the transaction stream
+            |c: &Customer| c.id,
+            |tx: &Transaction| tx.customer_id,
         )
-        .if_not_exists_zero_copy(
-            builder.for_each::<SecurityAlert>(),
-            bituple_transaction_location_key(),
-            alert_location_key(),
+        // After the join, the stream contains (Customer, Transaction) tuples.
+        // We check for the non-existence of an alert based on the transaction's location.
+        .if_not_exists_bi(
+            alerts_stream.clone(), // Reuse the alerts stream
+            |tx: &Transaction| tx.location.clone(), // Key from the second fact (Transaction) of the incoming stream
+            |alert: &SecurityAlert| alert.location.clone(), // Key from the "other" stream
         )
-        .penalize_zero_copy("high_risk_transaction_without_alert", fixed_penalty_impact(1000.0));
+        .penalize("high_risk_transaction_without_alert", |_| SimpleScore::new(1000.0));
 
-    // Build the session with all constraints
-    let session = builder
-        .constraint("high_value_transaction", 1.0, move || high_value_constraint.clone())
-        .constraint("excessive_transactions_per_customer", 1.0, move || excessive_transactions_constraint.clone())
-        .constraint("transaction_in_alerted_location", 1.0, move || alerted_location_constraint.clone())
-        .constraint("inactive_customer_transaction", 1.0, move || inactive_customer_constraint.clone())
-        .constraint("high_risk_transaction_without_alert", 1.0, move || high_risk_no_alert_constraint.clone())
-        .build()?;
-
-    Ok(session)
+    // Build the session from all the defined constraints.
+    builder.build()
 }
 
-// --- Data Generation ---
+// --- Data Generation (Unchanged) ---
 
 fn generate_data(
     num_customers: usize,
     num_transactions: usize,
     num_locations: usize,
 ) -> (Vec<Customer>, Vec<Transaction>, Vec<SecurityAlert>) {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     // Generate locations
     let locations: Vec<String> = (0..num_locations)
@@ -351,12 +261,12 @@ fn generate_data(
     let customers: Vec<Customer> = (0..num_customers)
         .map(|i| Customer {
             id: i as i32,
-            risk_level: match rng.gen_range(0..3) {
+            risk_level: match rng.random_range(0..3) {
                 0 => RiskLevel::Low,
                 1 => RiskLevel::Medium,
                 _ => RiskLevel::High,
             },
-            status: if rng.gen_bool(0.95) {
+            status: if rng.random_bool(0.95) {
                 CustomerStatus::Active
             } else {
                 CustomerStatus::Inactive
@@ -368,9 +278,9 @@ fn generate_data(
     let transactions: Vec<Transaction> = (0..num_transactions)
         .map(|i| Transaction {
             id: i as i32,
-            customer_id: rng.gen_range(0..num_customers) as i32,
-            amount: rng.gen_range(100..50_000_000), // 1 cent to $500,000 in cents
-            location: locations[rng.gen_range(0..locations.len())].clone(),
+            customer_id: rng.random_range(0..num_customers) as i32,
+            amount: rng.random_range(1.0..500000.0), // Amount in dollars
+            location: locations[rng.random_range(0..locations.len())].clone(),
         })
         .collect();
 
@@ -381,17 +291,17 @@ fn generate_data(
         .into_iter()
         .map(|loc| SecurityAlert {
             location: loc.clone(),
-            severity: rng.gen_range(1..=5),
+            severity: rng.random_range(1..=5),
         })
         .collect();
 
     (customers, transactions, alerts)
 }
 
-// --- Performance Testing ---
+// --- Performance Testing (Updated to call new build function) ---
 
 fn run_performance_benchmark() -> Result<()> {
-    println!("### Starting Pure Zero-Copy API Performance Test ###");
+    println!("### Starting Modern Fluent API Performance Test ###");
 
     // Configuration
     const NUM_CUSTOMERS: usize = 10_000;
@@ -400,7 +310,7 @@ fn run_performance_benchmark() -> Result<()> {
 
     // 1. Setup Phase
     let setup_start = Instant::now();
-    let mut session = build_constraints_with_zero_copy()?;
+    let mut session = build_constraints()?; // <-- Use the rewritten function
     let setup_duration = setup_start.elapsed();
 
     // 2. Data Generation Phase
@@ -410,7 +320,7 @@ fn run_performance_benchmark() -> Result<()> {
     let data_gen_duration = data_start.elapsed();
 
     // Debug information
-    let high_value_count = transactions.iter().filter(|tx| tx.amount > 4_500_000).count();
+    let high_value_count = transactions.iter().filter(|tx| tx.amount > 45000.0).count();
     let inactive_customers = customers.iter().filter(|c| matches!(c.status, CustomerStatus::Inactive)).count();
     let high_risk_customers = customers.iter().filter(|c| matches!(c.risk_level, RiskLevel::High)).count();
     
@@ -423,8 +333,8 @@ fn run_performance_benchmark() -> Result<()> {
     println!("Debug: Security alerts: {} for {} locations ({:.2}%)", 
              alerts.len(), NUM_LOCATIONS, alerts.len() as f64 / NUM_LOCATIONS as f64 * 100.0);
 
-    // 3. Processing Phase using pure zero-copy operations
-    println!("Processing facts using pure zero-copy API...");
+    // 3. Processing Phase
+    println!("Processing facts using modern fluent API...");
     let processing_start = Instant::now();
 
     session.insert_batch(customers)?;
@@ -458,7 +368,7 @@ fn run_performance_benchmark() -> Result<()> {
     let stats = session.get_statistics();
 
     // 6. Comprehensive reporting
-    println!("\n=== PURE ZERO-COPY API PERFORMANCE RESULTS ===");
+    println!("\n=== MODERN FLUENT API PERFORMANCE RESULTS ===");
     
     println!("\n🚀 Performance Metrics:");
     println!("┌─────────────────────────────────┬─────────────────────┐");
@@ -467,9 +377,9 @@ fn run_performance_benchmark() -> Result<()> {
     println!("│ Total Facts Processed          │ {:>19} │", format!("{:}", total_facts));
     println!("│ Setup Time                      │ {:>15.4} s │", setup_duration.as_secs_f64());
     println!("│ Data Generation Time            │ {:>15.4} s │", data_gen_duration.as_secs_f64());
-    println!("│ **Zero-Copy Processing Time**   │ **{:>11.4} s** │", processing_duration.as_secs_f64());
+    println!("│ **Processing Time** │ **{:>11.4} s** │", processing_duration.as_secs_f64());
     println!("│ Total Time                      │ {:>15.4} s │", total_duration.as_secs_f64());
-    println!("│ **Zero-Copy Throughput**        │ **{:>9.0} facts/s** │", facts_per_second);
+    println!("│ **Throughput** │ **{:>9.0} facts/s** │", facts_per_second);
     println!("│ Memory Efficiency               │ {:>11.0} facts/MB │", memory_efficiency);
     println!("└─────────────────────────────────┴─────────────────────┘");
 
@@ -504,7 +414,7 @@ fn run_performance_benchmark() -> Result<()> {
     println!("• **Total Nodes:** {}", stats.total_nodes);
     println!("• **Scoring Nodes:** {}", stats.scoring_nodes);
     println!("• **Network Efficiency:** {:.2} facts per node", 
-             total_facts as f64 / stats.total_nodes as f64);
+             if stats.total_nodes > 0 { total_facts as f64 / stats.total_nodes as f64 } else { 0.0 });
 
     // 8. Validate system consistency
     session.validate_consistency()?;

@@ -1,15 +1,20 @@
-//! Stream definition with traditional API removed and zero-copy focus.
+//stream_def.rs
+//! Stream definition with unified API combining traditional and zero-copy operations.
 
 use super::factory::ConstraintFactory;
 use super::joiner::JoinerType;
 use super::collectors::BaseCollector;
-use crate::nodes::ImpactFn;
+use crate::nodes::{ImpactFn, ZeroCopyKeyFn, ZeroCopyPredicate, ZeroCopyImpactFn, ZeroCopyMapperFn};
 use crate::{GreynetFact, Score, AnyTuple};
 use std::any::TypeId;
 use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::hash::Hash;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::Hasher;
+use crate::prelude::ZeroCopyFacts;
 
 #[derive(Clone)]
 pub struct Arity1;
@@ -79,7 +84,6 @@ impl std::fmt::Debug for CollectorSupplier {
 /// A simplified function identifier, now a newtype struct.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct FunctionId(pub usize);
-
 
 // RetrievalId identifies a unique stream instance in the dataflow graph.
 #[derive(Clone, Debug)]
@@ -421,6 +425,11 @@ impl<S: Score> FlatMapDefinition<S> {
     }
 }
 
+pub fn extract_fact<T: GreynetFact>(tuple: &dyn ZeroCopyFacts, index: usize) -> Option<&T> {
+    tuple.get_fact_ref(index)
+         .and_then(|fact| fact.as_any().downcast_ref::<T>())
+}
+
 #[derive(Clone)]
 pub struct Stream<A, S: Score> {
     pub(crate) definition: StreamDefinition<S>,
@@ -439,40 +448,526 @@ impl<A, S: Score> Stream<A, S> {
         }
     }
 
-    /// Zero-copy penalize method for high performance.
-    pub fn penalize_zero_copy(
+    /// Unified penalize method that consumes the stream and registers the complete ConstraintRecipe
+    pub fn penalize(
         self, 
         constraint_id: &str, 
-        penalty_function: crate::nodes::ZeroCopyImpactFn<S>
+        penalty_function: impl Fn(&AnyTuple) -> S + 'static
     ) -> ConstraintRecipe<S> {
-        ConstraintRecipe {
-            stream_def: self.definition,
-            penalty_function: crate::nodes::ImpactFn(penalty_function),
-            constraint_id: constraint_id.to_string(),
+        // Convert closure to zero-copy impact function
+        let zero_copy_impact_fn: ZeroCopyImpactFn<S> = Rc::new(move |tuple| {
+            // Convert ZeroCopyFacts to AnyTuple for the penalty function
+            // This is a bridge between the old and new APIs
+            if let Some(any_tuple) = tuple.as_any().downcast_ref::<AnyTuple>() {
+                penalty_function(any_tuple)
+            } else {
+                S::null_score()
+            }
+        });
+
+        // Register the function with the factory and get the recipe
+        if let Some(factory_rc) = self.factory.upgrade() {
+            let impact_fn_id = factory_rc.borrow_mut().register_zero_copy_impact_fn(zero_copy_impact_fn.clone());
+            
+            let recipe = ConstraintRecipe {
+                stream_def: self.definition,
+                penalty_function: ImpactFn(zero_copy_impact_fn),
+                constraint_id: constraint_id.to_string(),
+            };
+            
+            // Register the recipe with the factory
+            factory_rc.borrow_mut().add_constraint_def(recipe.clone());
+            
+            recipe
+        } else {
+            panic!("ConstraintFactory has been dropped")
         }
     }
+    
+    /// Filters the stream using a predicate that can inspect the entire tuple.
+    pub fn filter_tuple<F>(self, predicate: F) -> Self
+    where
+        F: Fn(&dyn ZeroCopyFacts) -> bool + 'static,
+    {
+        let zero_copy_predicate: ZeroCopyPredicate = Rc::new(predicate);
 
-    /// Zero-copy flat_map method.
-    pub fn flat_map_zero_copy(self, mapper_fn: crate::nodes::ZeroCopyMapperFn) -> Stream<Arity1, S> {
         let factory_rc = self.factory.upgrade().expect("ConstraintFactory has been dropped");
-        let mapper_fn_id = factory_rc.borrow_mut().register_zero_copy_mapper(mapper_fn);
+        let predicate_id = factory_rc.borrow_mut().register_zero_copy_predicate(zero_copy_predicate);
+        
+        let filter_def = FilterDefinition::new(self.definition, FunctionId(predicate_id));
+        Stream::new(StreamDefinition::Filter(filter_def), self.factory)
+    }
+
+    /// Filters a stream of single facts based on a type-safe predicate.
+    pub fn filter<T, F>(self, predicate: F) -> Self
+    where
+        T: GreynetFact,
+        F: Fn(&T) -> bool + 'static,
+    {
+        let zero_copy_predicate: ZeroCopyPredicate = Rc::new(move |tuple| {
+            // Use the `extract_fact` helper to simplify fact extraction.
+            extract_fact::<T>(tuple, 0)
+                .map_or(false, |typed_fact| predicate(typed_fact))
+        });
+
+        let factory_rc = self.factory.upgrade().expect("ConstraintFactory has been dropped");
+        let predicate_id = factory_rc.borrow_mut().register_zero_copy_predicate(zero_copy_predicate);
+        
+        let filter_def = FilterDefinition::new(self.definition, FunctionId(predicate_id));
+        Stream::new(StreamDefinition::Filter(filter_def), self.factory)
+    }
+
+    pub(crate) fn join_flex(
+        self,
+        other: Stream<Arity1, S>,
+        joiner_type: JoinerType,
+        left_key_fn: ZeroCopyKeyFn,
+        right_key_fn: ZeroCopyKeyFn,
+    ) -> Stream<Arity2, S> {
+        let factory_rc = self.factory.upgrade().expect("ConstraintFactory has been dropped");
+        let mut factory = factory_rc.borrow_mut();
+        
+        let left_key_fn_id = factory.register_zero_copy_key_fn(left_key_fn);
+        let right_key_fn_id = factory.register_zero_copy_key_fn(right_key_fn);
+        
+        let join_def = JoinDefinition::new(
+            self.definition,
+            other.definition,
+            joiner_type,
+            FunctionId(left_key_fn_id),
+            FunctionId(right_key_fn_id),
+        );
+        
+        Stream::new(StreamDefinition::Join(join_def), self.factory)
+    }
+
+    /// Enhanced flat_map with type-safe closure support
+    pub fn flat_map<T, F>(self, mapper: F) -> Stream<Arity1, S>
+    where
+        T: GreynetFact,
+        F: Fn(&T) -> Vec<Rc<dyn GreynetFact>> + 'static,
+    {
+        let zero_copy_mapper: ZeroCopyMapperFn = Rc::new(move |tuple| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T>())
+                .map(|typed_fact| mapper(typed_fact))
+                .unwrap_or_else(|| Vec::new())
+        });
+
+        let factory_rc = self.factory.upgrade().expect("ConstraintFactory has been dropped");
+        let mapper_fn_id = factory_rc.borrow_mut().register_zero_copy_mapper(zero_copy_mapper);
+        
         let flatmap_def = FlatMapDefinition::new(self.definition, FunctionId(mapper_fn_id));
         Stream::new(StreamDefinition::FlatMap(flatmap_def), self.factory)
     }
 
-    /// Zero-copy filter method.
-    pub fn filter_zero_copy(self, predicate: crate::nodes::ZeroCopyPredicate) -> Self {
-        let factory_rc = self.factory.upgrade().expect("ConstraintFactory has been dropped");
-        let predicate_id = factory_rc.borrow_mut().register_zero_copy_predicate(predicate);
-        let filter_def = FilterDefinition::new(self.definition, FunctionId(predicate_id));
-        Stream::new(StreamDefinition::Filter(filter_def), self.factory)
-    }
-    
     pub fn get_retrieval_id(&self) -> RetrievalId<S> {
         self.definition.get_retrieval_id()
     }
 
     pub fn arity(&self) -> usize {
         self.definition.output_arity()
+    }
+}
+
+// Enhanced join operations for Arity1 streams
+impl<S: Score + 'static> Stream<Arity1, S> {
+    /// Type-safe join with automatic key extraction
+    pub fn join_on<T1, T2, F1, F2, K>(
+        self,
+        other: Stream<Arity1, S>,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Stream<Arity2, S>
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        let left_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T1>())
+                .map(|typed_fact| {
+                    let mut hasher = DefaultHasher::new();
+                    left_key_fn(typed_fact).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0)
+        });
+
+        let right_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T2>())
+                .map(|typed_fact| {
+                    let mut hasher = DefaultHasher::new();
+                    right_key_fn(typed_fact).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0)
+        });
+
+        self.join_flex(other, JoinerType::Equal, left_zero_copy_key_fn, right_zero_copy_key_fn)
+    }
+
+    /// Conditional join - if exists
+    pub fn if_exists<T1, T2, F1, F2, K>(
+        self,
+        other: Stream<Arity1, S>,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Self
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        self.if_conditionally(other, true, left_key_fn, right_key_fn)
+    }
+
+    /// Conditional join - if not exists
+    pub fn if_not_exists<T1, T2, F1, F2, K>(
+        self,
+        other: Stream<Arity1, S>,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Self
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        self.if_conditionally(other, false, left_key_fn, right_key_fn)
+    }
+
+    /// Helper method for conditional joins
+    fn if_conditionally<T1, T2, F1, F2, K>(
+        self,
+        other: Stream<Arity1, S>,
+        should_exist: bool,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Self
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        let left_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T1>())
+                .map(|typed_fact| {
+                    let mut hasher = DefaultHasher::new();
+                    left_key_fn(typed_fact).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0)
+        });
+
+        let right_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T2>())
+                .map(|typed_fact| {
+                    let mut hasher = DefaultHasher::new();
+                    right_key_fn(typed_fact).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0)
+        });
+
+        let factory_rc = self.factory.upgrade().expect("ConstraintFactory has been dropped");
+        let mut factory = factory_rc.borrow_mut();
+        
+        let left_key_fn_id = factory.register_zero_copy_key_fn(left_zero_copy_key_fn);
+        let right_key_fn_id = factory.register_zero_copy_key_fn(right_zero_copy_key_fn);
+        
+        let cond_def = ConditionalJoinDefinition::new(
+            self.definition,
+            other.definition,
+            should_exist,
+            FunctionId(left_key_fn_id),
+            FunctionId(right_key_fn_id),
+        );
+        
+        Stream::new(StreamDefinition::ConditionalJoin(cond_def), self.factory)
+    }
+
+    /// Group by with type-safe key extraction
+    pub fn group_by<T, F, K>(
+        self,
+        key_fn: F,
+        collector_supplier: Box<dyn Fn() -> Box<dyn BaseCollector>>,
+    ) -> Stream<Arity2, S>
+    where
+        T: GreynetFact,
+        F: Fn(&T) -> K + 'static,
+        K: Hash + 'static,
+    {
+        let zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T>())
+                .map(|typed_fact| {
+                    let mut hasher = DefaultHasher::new();
+                    key_fn(typed_fact).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0)
+        });
+
+        let factory_rc = self.factory.upgrade().expect("ConstraintFactory has been dropped");
+        let key_fn_id = factory_rc.borrow_mut().register_zero_copy_key_fn(zero_copy_key_fn);
+        
+        let group_def = GroupDefinition::new(
+            self.definition,
+            FunctionId(key_fn_id),
+            CollectorSupplier::new(collector_supplier),
+        );
+        
+        Stream::new(StreamDefinition::Group(group_def), self.factory)
+    }
+}
+
+impl<S: Score + 'static> Stream<Arity2, S> {
+    /// Conditional join - if not exists for Arity2 streams
+    /// Extracts key from the first fact of the BiTuple
+    pub fn if_not_exists_first<T1, T2, F1, F2, K>(
+        self,
+        other: Stream<Arity1, S>,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Self
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        self.if_conditionally_first(other, false, left_key_fn, right_key_fn)
+    }
+
+    /// Conditional join - if not exists for Arity2 streams
+    /// Extracts key from the second fact of the BiTuple
+    pub fn if_not_exists_bi<T1, T2, F1, F2, K>(
+        self,
+        other: Stream<Arity1, S>,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Self
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        self.if_conditionally_bi(other, false, left_key_fn, right_key_fn)
+    }
+
+    /// Conditional join - if not exists for Arity2 streams with composite key
+    /// Extracts key from both facts of the BiTuple
+    pub fn if_not_exists_composite<T1, T2, T3, F1, F2, K>(
+        self,
+        other: Stream<Arity1, S>,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Self
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        T3: GreynetFact,
+        F1: Fn(&T1, &T2) -> K + 'static,
+        F2: Fn(&T3) -> K + 'static,
+        K: Hash + 'static,
+    {
+        self.if_conditionally_composite(other, false, left_key_fn, right_key_fn)
+    }
+
+    /// Conditional join - if exists for Arity2 streams (first fact)
+    pub fn if_exists_first<T1, T2, F1, F2, K>(
+        self,
+        other: Stream<Arity1, S>,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Self
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        self.if_conditionally_first(other, true, left_key_fn, right_key_fn)
+    }
+
+    /// Conditional join - if exists for Arity2 streams (second fact)
+    pub fn if_exists_bi<T1, T2, F1, F2, K>(
+        self,
+        other: Stream<Arity1, S>,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Self
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        self.if_conditionally_bi(other, true, left_key_fn, right_key_fn)
+    }
+
+    // Helper methods for conditional joins
+
+    fn if_conditionally_first<T1, T2, F1, F2, K>(
+        self,
+        other: Stream<Arity1, S>,
+        should_exist: bool,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Self
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        let left_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T1>())
+                .map(|typed_fact| {
+                    let mut hasher = DefaultHasher::new();
+                    left_key_fn(typed_fact).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0)
+        });
+
+        let right_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T2>())
+                .map(|typed_fact| {
+                    let mut hasher = DefaultHasher::new();
+                    right_key_fn(typed_fact).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0)
+        });
+
+        self.create_conditional_join(other, should_exist, left_zero_copy_key_fn, right_zero_copy_key_fn)
+    }
+
+    fn if_conditionally_bi<T1, T2, F1, F2, K>(
+        self,
+        other: Stream<Arity1, S>,
+        should_exist: bool,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Self
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        F1: Fn(&T1) -> K + 'static,
+        F2: Fn(&T2) -> K + 'static,
+        K: Hash + 'static,
+    {
+        let left_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            tuple.get_fact_ref(1) // Second fact (index 1)
+                .and_then(|fact| fact.as_any().downcast_ref::<T1>())
+                .map(|typed_fact| {
+                    let mut hasher = DefaultHasher::new();
+                    left_key_fn(typed_fact).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0)
+        });
+
+        let right_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T2>())
+                .map(|typed_fact| {
+                    let mut hasher = DefaultHasher::new();
+                    right_key_fn(typed_fact).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0)
+        });
+
+        self.create_conditional_join(other, should_exist, left_zero_copy_key_fn, right_zero_copy_key_fn)
+    }
+
+    fn if_conditionally_composite<T1, T2, T3, F1, F2, K>(
+        self,
+        other: Stream<Arity1, S>,
+        should_exist: bool,
+        left_key_fn: F1,
+        right_key_fn: F2,
+    ) -> Self
+    where
+        T1: GreynetFact,
+        T2: GreynetFact,
+        T3: GreynetFact,
+        F1: Fn(&T1, &T2) -> K + 'static,
+        F2: Fn(&T3) -> K + 'static,
+        K: Hash + 'static,
+    {
+        let left_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            if let (Some(fact1), Some(fact2)) = (tuple.get_fact_ref(0), tuple.get_fact_ref(1)) {
+                if let (Some(typed_fact1), Some(typed_fact2)) = (
+                    fact1.as_any().downcast_ref::<T1>(),
+                    fact2.as_any().downcast_ref::<T2>(),
+                ) {
+                    let mut hasher = DefaultHasher::new();
+                    left_key_fn(typed_fact1, typed_fact2).hash(&mut hasher);
+                    return hasher.finish();
+                }
+            }
+            0
+        });
+
+        let right_zero_copy_key_fn: ZeroCopyKeyFn = Rc::new(move |tuple| {
+            tuple.first_fact()
+                .and_then(|fact| fact.as_any().downcast_ref::<T3>())
+                .map(|typed_fact| {
+                    let mut hasher = DefaultHasher::new();
+                    right_key_fn(typed_fact).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0)
+        });
+
+        self.create_conditional_join(other, should_exist, left_zero_copy_key_fn, right_zero_copy_key_fn)
+    }
+
+    fn create_conditional_join(
+        self,
+        other: Stream<Arity1, S>,
+        should_exist: bool,
+        left_zero_copy_key_fn: ZeroCopyKeyFn,
+        right_zero_copy_key_fn: ZeroCopyKeyFn,
+    ) -> Self {
+        let factory_rc = self.factory.upgrade().expect("ConstraintFactory has been dropped");
+        let mut factory = factory_rc.borrow_mut();
+        
+        let left_key_fn_id = factory.register_zero_copy_key_fn(left_zero_copy_key_fn);
+        let right_key_fn_id = factory.register_zero_copy_key_fn(right_zero_copy_key_fn);
+        
+        let cond_def = ConditionalJoinDefinition::new(
+            self.definition,
+            other.definition,
+            should_exist,
+            FunctionId(left_key_fn_id),
+            FunctionId(right_key_fn_id),
+        );
+        
+        Stream::new(StreamDefinition::ConditionalJoin(cond_def), self.factory)
     }
 }
