@@ -14,7 +14,6 @@ use crate::factory::ConstraintFactory;
 use crate::joiner::JoinerType;
 use crate::tuple::{AnyTuple, ZeroCopyFacts};
 use crate::collectors::BaseCollector;
-use crate::nodes::SharedMapperFn;
 use crate::{Score, GreynetFact};
 use std::rc::{Rc, Weak};
 use std::cell::RefCell;
@@ -43,7 +42,7 @@ impl<A, S: Score + 'static> ZeroCopyStreamOps<A, S> for Stream<A, S> {
         
         let filter_def = FilterDefinition {
             source: Box::new(self.definition),
-            predicate_id: FunctionId::ZeroCopy(predicate_id),
+            predicate_id: FunctionId(predicate_id),
             _phantom: PhantomData,
         };
         
@@ -213,8 +212,8 @@ impl<S: Score + 'static> ZeroCopyJoinOps<S> for Stream<Arity1, S> {
             left_source: Box::new(self.definition),
             right_source: Box::new(other.definition),
             joiner_type,
-            left_key_fn_id: FunctionId::ZeroCopy(left_key_fn_id),
-            right_key_fn_id: FunctionId::ZeroCopy(right_key_fn_id),
+            left_key_fn_id: FunctionId(left_key_fn_id),
+            right_key_fn_id: FunctionId(right_key_fn_id),
             _phantom: PhantomData,
         };
         
@@ -250,7 +249,7 @@ impl<S: Score + 'static> ZeroCopyJoinOps<S> for Stream<Arity1, S> {
         
         let group_def = GroupDefinition {
             source: Box::new(self.definition),
-            key_fn_id: FunctionId::ZeroCopy(key_fn_id),
+            key_fn_id: FunctionId(key_fn_id),
             collector_supplier: crate::stream_def::CollectorSupplier::new(collector_supplier),
             _phantom: PhantomData,
         };
@@ -316,8 +315,8 @@ impl<A, S: Score + 'static> Stream<A, S> {
             source: Box::new(self.definition),
             other: Box::new(other.definition),
             should_exist,
-            left_key_fn_id: FunctionId::ZeroCopy(left_key_fn_id),
-            right_key_fn_id: FunctionId::ZeroCopy(right_key_fn_id),
+            left_key_fn_id: FunctionId(left_key_fn_id),
+            right_key_fn_id: FunctionId(right_key_fn_id),
             _phantom: PhantomData,
         };
         
@@ -346,8 +345,8 @@ macro_rules! impl_higher_arity_zero_copy {
                     left_source: Box::new(self.definition),
                     right_source: Box::new(other.definition),
                     joiner_type,
-                    left_key_fn_id: FunctionId::ZeroCopy(left_key_fn_id),
-                    right_key_fn_id: FunctionId::ZeroCopy(right_key_fn_id),
+                    left_key_fn_id: FunctionId(left_key_fn_id),
+                    right_key_fn_id: FunctionId(right_key_fn_id),
                     _phantom: PhantomData,
                 };
                 

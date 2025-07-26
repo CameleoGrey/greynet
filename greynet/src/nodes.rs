@@ -20,85 +20,54 @@ use crate::collectors::UndoReceipt;
 
 // --- Function Types ---
 
-// Traditional (old API) function types
-pub type SharedImpactFn<S> = Rc<dyn Fn(&AnyTuple) -> S>;
-pub type SharedKeyFn = Rc<dyn Fn(&AnyTuple) -> u64>;
-pub type SharedPredicate = Rc<dyn Fn(&AnyTuple) -> bool>;
-pub type SharedMapperFn = Rc<dyn Fn(&AnyTuple) -> Vec<Rc<dyn crate::fact::GreynetFact>>>;
-
 // Zero-Copy (new API) function types
 pub type ZeroCopyKeyFn = Rc<dyn Fn(&dyn ZeroCopyFacts) -> u64>;
 pub type ZeroCopyPredicate = Rc<dyn Fn(&dyn ZeroCopyFacts) -> bool>;
 pub type ZeroCopyImpactFn<S> = Rc<dyn Fn(&dyn ZeroCopyFacts) -> S>;
 pub type ZeroCopyMapperFn = Rc<dyn Fn(&dyn ZeroCopyFacts) -> Vec<Rc<dyn crate::fact::GreynetFact>>>;
 
-// --- ENUM WRAPPERS FOR TRUE ZERO-COPY PATH ---
-// These enums allow nodes to hold either a traditional or a zero-copy function,
-// enabling a true fast path for the new API.
+// --- Simplified Newtype Struct Wrappers ---
 
 #[derive(Clone)]
-pub enum Predicate {
-    Traditional(SharedPredicate),
-    ZeroCopy(ZeroCopyPredicate),
-}
+pub struct Predicate(pub ZeroCopyPredicate);
 
 impl Predicate {
     #[inline]
     fn execute(&self, tuple: &AnyTuple) -> bool {
-        match self {
-            Predicate::Traditional(p) => p(tuple),
-            Predicate::ZeroCopy(p) => p(tuple),
-        }
+        self.0(tuple)
     }
 }
 
 #[derive(Clone)]
-pub enum KeyFn {
-    Traditional(SharedKeyFn),
-    ZeroCopy(ZeroCopyKeyFn),
-}
+pub struct KeyFn(pub ZeroCopyKeyFn);
 
 impl KeyFn {
     #[inline]
     fn execute(&self, tuple: &AnyTuple) -> u64 {
-        match self {
-            KeyFn::Traditional(k) => k(tuple),
-            KeyFn::ZeroCopy(k) => k(tuple),
-        }
+        self.0(tuple)
     }
 }
 
 #[derive(Clone)]
-pub enum ImpactFn<S: Score> {
-    Traditional(SharedImpactFn<S>),
-    ZeroCopy(ZeroCopyImpactFn<S>),
-}
+pub struct ImpactFn<S: Score>(pub ZeroCopyImpactFn<S>);
 
 impl<S: Score> ImpactFn<S> {
     #[inline]
     fn execute(&self, tuple: &AnyTuple) -> S {
-        match self {
-            ImpactFn::Traditional(f) => f(tuple),
-            ImpactFn::ZeroCopy(f) => f(tuple),
-        }
+        self.0(tuple)
     }
 }
 
 #[derive(Clone)]
-pub enum MapperFn {
-    Traditional(SharedMapperFn),
-    ZeroCopy(ZeroCopyMapperFn),
-}
+pub struct MapperFn(pub ZeroCopyMapperFn);
 
 impl MapperFn {
     #[inline]
     fn execute(&self, tuple: &AnyTuple) -> Vec<Rc<dyn crate::fact::GreynetFact>> {
-        match self {
-            MapperFn::Traditional(f) => f(tuple),
-            MapperFn::ZeroCopy(f) => f(tuple),
-        }
+        self.0(tuple)
     }
 }
+
 
 // --- Node Definitions (Updated) ---
 
@@ -145,7 +114,7 @@ impl FromNode {
 
 pub struct FilterNode {
     pub children: Vec<NodeId>,
-    pub predicate: Predicate, // UPDATED
+    pub predicate: Predicate,
 }
 
 impl FilterNode {
@@ -164,7 +133,6 @@ impl FilterNode {
         operations: &mut Vec<NodeOperation>,
     ) -> Result<()> {
         if let Ok(tuple) = tuples.get_tuple_checked(tuple_index) {
-            // UPDATED: Execute the predicate using the enum wrapper
             if self.predicate.execute(tuple) {
                 for &child_id in &self.children {
                     operations.push(NodeOperation::Insert(child_id, tuple_index));
@@ -182,7 +150,6 @@ impl FilterNode {
         operations: &mut Vec<NodeOperation>,
     ) -> Result<()> {
         if let Ok(tuple) = tuples.get_tuple_checked(tuple_index) {
-            // UPDATED: Execute the predicate using the enum wrapper
             if self.predicate.execute(tuple) {
                 for &child_id in &self.children {
                     operations.push(NodeOperation::Retract(child_id, tuple_index));
@@ -246,8 +213,8 @@ pub struct JoinNode {
     pub joiner_type: JoinerType,
     pub left_index: JoinIndex,
     pub right_index: JoinIndex,
-    pub left_key_fn: KeyFn, // UPDATED
-    pub right_key_fn: KeyFn, // UPDATED
+    pub left_key_fn: KeyFn,
+    pub right_key_fn: KeyFn,
     pub beta_memory: HashMap<PackedIndices, SafeTupleIndex>,
 }
 
@@ -276,7 +243,6 @@ impl JoinNode {
     ) -> Result<()> {
         let left_tuple = tuples.get_tuple_checked(tuple_index)?.clone();
     
-        // UPDATED: Execute key function via enum wrapper
         let key = self.left_key_fn.execute(&left_tuple);
         self.left_index.put(key, tuple_index);
     
@@ -312,7 +278,6 @@ impl JoinNode {
     ) -> Result<()> {
         let right_tuple = tuples.get_tuple_checked(tuple_index)?.clone();
 
-        // UPDATED: Execute key function via enum wrapper
         let key = self.right_key_fn.execute(&right_tuple);
         self.right_index.put(key, tuple_index);
 
@@ -348,7 +313,6 @@ impl JoinNode {
         operations: &mut Vec<NodeOperation>,
     ) -> Result<()> {
         if let Ok(tuple) = tuples.get_tuple_checked(tuple_index) {
-            // UPDATED: Execute key function via enum wrapper
             let key = self.left_key_fn.execute(tuple);
             self.left_index.remove(key, &tuple_index);
         }
@@ -384,7 +348,6 @@ impl JoinNode {
         operations: &mut Vec<NodeOperation>,
     ) -> Result<()> {
         if let Ok(tuple) = tuples.get_tuple_checked(tuple_index) {
-            // UPDATED: Execute key function via enum wrapper
             let key = self.right_key_fn.execute(tuple);
             self.right_index.remove(key, &tuple_index);
         }
@@ -431,8 +394,8 @@ pub struct ConditionalNode {
     should_exist: bool,
     left_index: UniIndex<u64>,
     right_index: UniIndex<u64>,
-    left_key_fn: KeyFn, // UPDATED
-    right_key_fn: KeyFn, // UPDATED
+    left_key_fn: KeyFn,
+    right_key_fn: KeyFn,
     propagation_map: HashMap<SafeTupleIndex, u64>,
 }
 
@@ -460,7 +423,6 @@ impl ConditionalNode {
         operations: &mut Vec<NodeOperation>,
     ) -> Result<()> {
         let key = if let Ok(tuple) = tuples.get_tuple_checked(tuple_index) {
-            // UPDATED: Execute key function via enum wrapper
             self.left_key_fn.execute(tuple)
         } else {
             return Ok(());
@@ -479,8 +441,6 @@ impl ConditionalNode {
         Ok(())
     }
 
-    // ... other methods in ConditionalNode need similar updates for key_fn execution ...
-    // (Omitted for brevity, but the pattern is the same as above)
     pub fn insert_right_collect_ops(
         &mut self,
         tuple_index: SafeTupleIndex,
@@ -593,7 +553,6 @@ pub struct GroupNode {
     key_fn: KeyFn,
     collector_supplier: CollectorSupplier,
     groups: HashMap<u64, Box<dyn BaseCollector>>,
-    // MODIFIED: This map now stores the receipt instead of a boxed closure.
     tuple_to_receipt: HashMap<SafeTupleIndex, (u64, UndoReceipt)>,
     group_key_to_tuple: HashMap<u64, SafeTupleIndex>,
 }
@@ -610,7 +569,6 @@ impl GroupNode {
         }
     }
 
-    // MODIFIED: insert_collect_ops now stores an UndoReceipt.
     pub fn insert_collect_ops(
         &mut self,
         tuple_index: SafeTupleIndex,
@@ -631,7 +589,6 @@ impl GroupNode {
         Ok(())
     }
 
-    // MODIFIED: retract_collect_ops now calls the collector's `remove` method.
     pub fn retract_collect_ops(
         &mut self,
         tuple_index: SafeTupleIndex,
@@ -639,7 +596,6 @@ impl GroupNode {
         operations: &mut Vec<NodeOperation>,
     ) -> Result<()> {
         if let Some((key, receipt)) = self.tuple_to_receipt.remove(&tuple_index) {
-            // Fetch the parent tuple to pass to the collector's remove method.
             let parent_tuple = tuples.get_tuple_checked(tuple_index)?;
             if let Some(collector) = self.groups.get_mut(&key) {
                 collector.remove(parent_tuple, receipt);
@@ -667,7 +623,6 @@ impl GroupNode {
         Ok(())
     }
 
-    // This method remains the same internally.
     fn update_or_create_child(
         &mut self,
         key: u64,
@@ -732,16 +687,14 @@ impl std::fmt::Debug for GroupNode {
     }
 }
 
-
-// Updated FlatMapNode to use MapperFn wrapper
 pub struct FlatMapNode {
     pub children: Vec<NodeId>,
-    mapper_fn: MapperFn, // UPDATED: Use wrapper enum
+    mapper_fn: MapperFn,
     parent_to_children_map: HashMap<SafeTupleIndex, Vec<SafeTupleIndex>>,
 }
 
 impl FlatMapNode {
-    pub fn new(mapper_fn: MapperFn) -> Self { // UPDATED: Use wrapper enum
+    pub fn new(mapper_fn: MapperFn) -> Self {
         Self {
             children: Vec::new(),
             mapper_fn,
@@ -756,7 +709,6 @@ impl FlatMapNode {
         operations: &mut Vec<NodeOperation>,
     ) -> Result<()> {
         let parent_tuple = tuples.get_tuple_checked(parent_tuple_idx)?;
-        // UPDATED: Execute via wrapper enum for zero-copy optimization
         let new_facts = self.mapper_fn.execute(parent_tuple);
 
         if new_facts.is_empty() {
@@ -807,7 +759,7 @@ impl std::fmt::Debug for FlatMapNode {
 
 pub struct ScoringNode<S: Score> {
     pub constraint_id: String,
-    pub penalty_function: ImpactFn<S>, // UPDATED: Use wrapper enum
+    pub penalty_function: ImpactFn<S>,
     pub weights: Rc<RefCell<ConstraintWeights>>,
     pub matches: HashMap<SafeTupleIndex, S>,
 }
@@ -815,7 +767,7 @@ pub struct ScoringNode<S: Score> {
 impl<S: Score> ScoringNode<S> {
     pub fn new(
         constraint_id: String,
-        penalty_function: ImpactFn<S>, // UPDATED: Use wrapper enum
+        penalty_function: ImpactFn<S>,
         weights: Rc<RefCell<ConstraintWeights>>,
     ) -> Self {
         Self {
@@ -834,7 +786,6 @@ impl<S: Score> ScoringNode<S> {
         _operations: &mut Vec<NodeOperation>,
     ) -> Result<()> {
         if let Ok(tuple) = tuples.get_tuple_checked(tuple_index) {
-            // UPDATED: Execute via wrapper enum for zero-copy optimization
             let base_score = self.penalty_function.execute(tuple);
             let weight = self.weights.borrow().get_weight(&self.constraint_id);
             let weighted_score = base_score.mul(weight);
@@ -865,7 +816,6 @@ impl<S: Score> ScoringNode<S> {
         let weight = self.weights.borrow().get_weight(&self.constraint_id);
         for (tuple_idx, score_val) in self.matches.iter_mut() {
             if let Ok(tuple) = tuples.get_tuple_checked(*tuple_idx) {
-                // UPDATED: Execute via wrapper enum for zero-copy optimization
                 let base_score = self.penalty_function.execute(tuple);
                 *score_val = base_score.mul(weight);
             }

@@ -1,8 +1,7 @@
-//! Fixed stream_def.rs with proper RetrievalId implementation and zero-copy integration
+//! Stream definition with traditional API removed and zero-copy focus.
 
 use super::factory::ConstraintFactory;
 use super::joiner::JoinerType;
-use super::nodes::{SharedKeyFn, SharedPredicate, SharedImpactFn, SharedMapperFn};
 use super::collectors::BaseCollector;
 use crate::nodes::ImpactFn;
 use crate::{GreynetFact, Score, AnyTuple};
@@ -26,7 +25,7 @@ pub struct Arity5;
 #[derive(Clone)]
 pub struct ConstraintRecipe<S: Score> {
     pub stream_def: StreamDefinition<S>,
-    pub penalty_function: crate::nodes::ImpactFn<S>, // UPDATED: Use wrapper enum
+    pub penalty_function: crate::nodes::ImpactFn<S>,
     pub constraint_id: String,
 }
 
@@ -77,36 +76,12 @@ impl std::fmt::Debug for CollectorSupplier {
     }
 }
 
-/// FIXED: Enhanced FunctionId with proper Hash and PartialEq implementations
+/// A simplified function identifier, now a newtype struct.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub enum FunctionId {
-    Traditional(usize),
-    ZeroCopy(usize),
-}
+pub struct FunctionId(pub usize);
 
-impl FunctionId {
-    /// Get the underlying ID regardless of function type
-    #[inline]
-    pub fn id(&self) -> usize {
-        match self {
-            FunctionId::Traditional(id) | FunctionId::ZeroCopy(id) => *id,
-        }
-    }
-    
-    /// Check if this is a zero-copy function
-    #[inline]
-    pub fn is_zero_copy(&self) -> bool {
-        matches!(self, FunctionId::ZeroCopy(_))
-    }
-    
-    /// Check if this is a traditional function
-    #[inline]
-    pub fn is_traditional(&self) -> bool {
-        matches!(self, FunctionId::Traditional(_))
-    }
-}
 
-// Fixed RetrievalId with proper trait bounds
+// RetrievalId identifies a unique stream instance in the dataflow graph.
 #[derive(Clone, Debug)]
 pub enum RetrievalId<S: Score> {
     From(TypeId, PhantomData<S>),
@@ -135,7 +110,7 @@ pub enum RetrievalId<S: Score> {
     },
     FlatMap {
         source: Box<RetrievalId<S>>,
-        mapper_fn_id: usize,
+        mapper_fn_id: FunctionId,
     },
     Scoring {
         source: Box<RetrievalId<S>>,
@@ -236,7 +211,7 @@ pub enum StreamDefinition<S: Score> {
     ConditionalJoin(ConditionalJoinDefinition<S>),
     Group(GroupDefinition<S>),
     FlatMap(FlatMapDefinition<S>),
-    Scoring(ScoringDefinition<S>), // NEW: Add scoring definition
+    Scoring(ScoringDefinition<S>),
 }
 
 impl<S: Score> StreamDefinition<S> {
@@ -268,9 +243,9 @@ impl<S: Score> StreamDefinition<S> {
             },
             StreamDefinition::FlatMap(def) => RetrievalId::FlatMap {
                 source: Box::new(def.source.get_retrieval_id()),
-                mapper_fn_id: def.mapper_fn_id.id(), // UPDATED: Use .id() method
+                mapper_fn_id: def.mapper_fn_id.clone(),
             },
-            StreamDefinition::Scoring(def) => RetrievalId::Scoring { // NEW: Add scoring retrieval
+            StreamDefinition::Scoring(def) => RetrievalId::Scoring {
                 source: Box::new(def.source.get_retrieval_id()),
                 impact_fn_id: def.impact_fn_id.clone(),
                 constraint_id: def.constraint_id.clone(),
@@ -278,7 +253,6 @@ impl<S: Score> StreamDefinition<S> {
         }
     }
     
-    /// Get the expected output arity of this stream definition
     pub fn output_arity(&self) -> usize {
         match self {
             StreamDefinition::From(_) => 1,
@@ -289,7 +263,7 @@ impl<S: Score> StreamDefinition<S> {
             StreamDefinition::ConditionalJoin(def) => def.source.output_arity(),
             StreamDefinition::Group(_) => 2,
             StreamDefinition::FlatMap(_) => 1,
-            StreamDefinition::Scoring(def) => def.source.output_arity(), // NEW: Scoring doesn't change arity
+            StreamDefinition::Scoring(def) => def.source.output_arity(),
         }
     }
 }
@@ -433,7 +407,7 @@ impl<S: Score> ScoringDefinition<S> {
 #[derive(Clone)]
 pub struct FlatMapDefinition<S: Score> {
     pub source: Box<StreamDefinition<S>>,
-    pub mapper_fn_id: FunctionId, // UPDATED: Use FunctionId instead of usize
+    pub mapper_fn_id: FunctionId,
     pub _phantom: PhantomData<S>,
 }
 
@@ -465,15 +439,7 @@ impl<A, S: Score> Stream<A, S> {
         }
     }
 
-    pub fn penalize(self, constraint_id: &str, penalty_function: impl Fn(&AnyTuple) -> S + 'static) -> ConstraintRecipe<S> {
-        ConstraintRecipe {
-            stream_def: self.definition,
-            penalty_function: crate::nodes::ImpactFn::Traditional(Rc::new(penalty_function)),
-            constraint_id: constraint_id.to_string(),
-        }
-    }
-
-    /// NEW: Zero-copy penalize method for high performance
+    /// Zero-copy penalize method for high performance.
     pub fn penalize_zero_copy(
         self, 
         constraint_id: &str, 
@@ -481,60 +447,25 @@ impl<A, S: Score> Stream<A, S> {
     ) -> ConstraintRecipe<S> {
         ConstraintRecipe {
             stream_def: self.definition,
-            penalty_function: crate::nodes::ImpactFn::ZeroCopy(penalty_function),
+            penalty_function: crate::nodes::ImpactFn(penalty_function),
             constraint_id: constraint_id.to_string(),
         }
     }
 
-    pub fn flat_map(self, mapper_fn: SharedMapperFn) -> Stream<Arity1, S> {
-        let factory_rc = self.factory.upgrade().expect("ConstraintFactory has been dropped");
-        let mapper_fn_id = factory_rc.borrow_mut().register_mapper(mapper_fn);
-        let flatmap_def = FlatMapDefinition::new(self.definition, FunctionId::Traditional(mapper_fn_id));
-        Stream::new(StreamDefinition::FlatMap(flatmap_def), self.factory)
-    }
-
+    /// Zero-copy flat_map method.
     pub fn flat_map_zero_copy(self, mapper_fn: crate::nodes::ZeroCopyMapperFn) -> Stream<Arity1, S> {
         let factory_rc = self.factory.upgrade().expect("ConstraintFactory has been dropped");
         let mapper_fn_id = factory_rc.borrow_mut().register_zero_copy_mapper(mapper_fn);
-        let flatmap_def = FlatMapDefinition::new(self.definition, FunctionId::ZeroCopy(mapper_fn_id));
+        let flatmap_def = FlatMapDefinition::new(self.definition, FunctionId(mapper_fn_id));
         Stream::new(StreamDefinition::FlatMap(flatmap_def), self.factory)
     }
 
-    pub fn filter(self, predicate: SharedPredicate) -> Self {
+    /// Zero-copy filter method.
+    pub fn filter_zero_copy(self, predicate: crate::nodes::ZeroCopyPredicate) -> Self {
         let factory_rc = self.factory.upgrade().expect("ConstraintFactory has been dropped");
-        let predicate_id = factory_rc.borrow_mut().register_predicate(predicate);
-        let filter_def = FilterDefinition::new(self.definition, FunctionId::Traditional(predicate_id));
+        let predicate_id = factory_rc.borrow_mut().register_zero_copy_predicate(predicate);
+        let filter_def = FilterDefinition::new(self.definition, FunctionId(predicate_id));
         Stream::new(StreamDefinition::Filter(filter_def), self.factory)
-    }
-
-    fn join_with<B, C>(self, other: Stream<B, S>, joiner_type: JoinerType, left_key_fn: SharedKeyFn, right_key_fn: SharedKeyFn) -> Stream<C, S> {
-        let factory_rc = self.factory.upgrade().expect("ConstraintFactory has been dropped");
-        let mut factory = factory_rc.borrow_mut();
-        let left_key_fn_id = factory.register_key_fn(left_key_fn);
-        let right_key_fn_id = factory.register_key_fn(right_key_fn);
-        let join_def = JoinDefinition::new(
-            self.definition,
-            other.definition,
-            joiner_type,
-            FunctionId::Traditional(left_key_fn_id),
-            FunctionId::Traditional(right_key_fn_id),
-        );
-        Stream::new(StreamDefinition::Join(join_def), self.factory)
-    }
-
-    fn if_conditionally<B>(self, other: Stream<B, S>, should_exist: bool, left_key_fn: SharedKeyFn, right_key_fn: SharedKeyFn) -> Stream<A, S> {
-        let factory_rc = self.factory.upgrade().expect("ConstraintFactory has been dropped");
-        let mut factory = factory_rc.borrow_mut();
-        let left_key_fn_id = factory.register_key_fn(left_key_fn);
-        let right_key_fn_id = factory.register_key_fn(right_key_fn);
-        let cond_def = ConditionalJoinDefinition::new(
-            self.definition,
-            other.definition,
-            should_exist,
-            FunctionId::Traditional(left_key_fn_id),
-            FunctionId::Traditional(right_key_fn_id),
-        );
-        Stream::new(StreamDefinition::ConditionalJoin(cond_def), self.factory)
     }
     
     pub fn get_retrieval_id(&self) -> RetrievalId<S> {
@@ -543,85 +474,5 @@ impl<A, S: Score> Stream<A, S> {
 
     pub fn arity(&self) -> usize {
         self.definition.output_arity()
-    }
-
-    
-}
-
-impl<S: Score> Stream<Arity1, S> {
-    pub fn join(self, other: Stream<Arity1, S>, joiner_type: JoinerType, left_key_fn: SharedKeyFn, right_key_fn: SharedKeyFn) -> Stream<Arity2, S> {
-        self.join_with(other, joiner_type, left_key_fn, right_key_fn)
-    }
-
-    pub fn if_exists(self, other: Stream<Arity1, S>, left_key_fn: SharedKeyFn, right_key_fn: SharedKeyFn) -> Stream<Arity1, S> {
-        self.if_conditionally(other, true, left_key_fn, right_key_fn)
-    }
-
-    pub fn if_not_exists(self, other: Stream<Arity1, S>, left_key_fn: SharedKeyFn, right_key_fn: SharedKeyFn) -> Stream<Arity1, S> {
-        self.if_conditionally(other, false, left_key_fn, right_key_fn)
-    }
-
-    pub fn group_by(self, key_fn: SharedKeyFn, collector_supplier: Box<dyn Fn() -> Box<dyn BaseCollector>>) -> Stream<Arity2, S> {
-        let factory_rc = self.factory.upgrade().expect("ConstraintFactory has been dropped");
-        let key_fn_id = factory_rc.borrow_mut().register_key_fn(key_fn);
-        let group_def = GroupDefinition::new(
-            self.definition,
-            FunctionId::Traditional(key_fn_id),
-            CollectorSupplier::new(collector_supplier),
-        );
-        Stream::new(StreamDefinition::Group(group_def), self.factory)
-    }
-
-}
-
-impl<S: Score> Stream<Arity2, S> {
-    pub fn join(self, other: Stream<Arity1, S>, joiner_type: JoinerType, left_key_fn: SharedKeyFn, right_key_fn: SharedKeyFn) -> Stream<Arity3, S> {
-        self.join_with(other, joiner_type, left_key_fn, right_key_fn)
-    }
-
-    pub fn if_exists(self, other: Stream<Arity1, S>, left_key_fn: SharedKeyFn, right_key_fn: SharedKeyFn) -> Stream<Arity2, S> {
-        self.if_conditionally(other, true, left_key_fn, right_key_fn)
-    }
-
-    pub fn if_not_exists(self, other: Stream<Arity1, S>, left_key_fn: SharedKeyFn, right_key_fn: SharedKeyFn) -> Stream<Arity2, S> {
-        self.if_conditionally(other, false, left_key_fn, right_key_fn)
-    }
-}
-
-impl<S: Score> Stream<Arity3, S> {
-    pub fn join(self, other: Stream<Arity1, S>, joiner_type: JoinerType, left_key_fn: SharedKeyFn, right_key_fn: SharedKeyFn) -> Stream<Arity4, S> {
-        self.join_with(other, joiner_type, left_key_fn, right_key_fn)
-    }
-
-    pub fn if_exists(self, other: Stream<Arity1, S>, left_key_fn: SharedKeyFn, right_key_fn: SharedKeyFn) -> Stream<Arity3, S> {
-        self.if_conditionally(other, true, left_key_fn, right_key_fn)
-    }
-
-    pub fn if_not_exists(self, other: Stream<Arity1, S>, left_key_fn: SharedKeyFn, right_key_fn: SharedKeyFn) -> Stream<Arity3, S> {
-        self.if_conditionally(other, false, left_key_fn, right_key_fn)
-    }
-}
-
-impl<S: Score> Stream<Arity4, S> {
-    pub fn join(self, other: Stream<Arity1, S>, joiner_type: JoinerType, left_key_fn: SharedKeyFn, right_key_fn: SharedKeyFn) -> Stream<Arity5, S> {
-        self.join_with(other, joiner_type, left_key_fn, right_key_fn)
-    }
-
-    pub fn if_exists(self, other: Stream<Arity1, S>, left_key_fn: SharedKeyFn, right_key_fn: SharedKeyFn) -> Stream<Arity4, S> {
-        self.if_conditionally(other, true, left_key_fn, right_key_fn)
-    }
-
-    pub fn if_not_exists(self, other: Stream<Arity1, S>, left_key_fn: SharedKeyFn, right_key_fn: SharedKeyFn) -> Stream<Arity4, S> {
-        self.if_conditionally(other, false, left_key_fn, right_key_fn)
-    }
-}
-
-impl<S: Score> Stream<Arity5, S> {
-    pub fn if_exists(self, other: Stream<Arity1, S>, left_key_fn: SharedKeyFn, right_key_fn: SharedKeyFn) -> Stream<Arity5, S> {
-        self.if_conditionally(other, true, left_key_fn, right_key_fn)
-    }
-
-    pub fn if_not_exists(self, other: Stream<Arity1, S>, left_key_fn: SharedKeyFn, right_key_fn: SharedKeyFn) -> Stream<Arity5, S> {
-        self.if_conditionally(other, false, left_key_fn, right_key_fn)
     }
 }
