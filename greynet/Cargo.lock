@@ -68,7 +68,7 @@ dependencies = [
 
 [[package]]
 name = "greynet"
-version = "0.5.5"
+version = "0.8.0"
 dependencies = [
  "crossbeam-deque",
  "generational-arena",

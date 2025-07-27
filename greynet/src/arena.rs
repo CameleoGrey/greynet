@@ -1,76 +1,44 @@
-//arena.rs
+// arena.rs
+
 use crate::join_adapters::*;
 use crate::nodes::{
     ConditionalNode, FilterNode, FlatMapNode, FromNode, GroupNode, JoinNode, ScoringNode,
 };
 use crate::score::Score;
-use crate::sparse_set::SparseSet;
 use crate::state::TupleState;
-use crate::tuple::{AnyTuple, TupleArity};
+use crate::tuple::AnyTuple;
 use crate::{GreynetError, Result, ResourceLimits};
-use generational_arena::{Arena, Index as TupleIndex};
 use rustc_hash::FxHashMap as HashMap;
-use slotmap::{DefaultKey, SlotMap};
-use smallvec::SmallVec;
+use slotmap::{DefaultKey, Key, SlotMap};
 
+/// A unique, stable identifier for a node in the `NodeArena`.
+/// It is an alias for `slotmap::DefaultKey`.
 pub type NodeId = DefaultKey;
 
+/// A stable, generational reference to a tuple in the `TupleArena`.
+/// This is a wrapper around `slotmap::DefaultKey` to provide a type-safe index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SafeTupleIndex {
-    pub(crate) index: TupleIndex,
-    pub(crate) generation: u64,
-}
-
-#[inline]
-pub fn bulk_update_states(
-    tuples: &mut [TupleState], 
-    from_state: TupleState, 
-    to_state: TupleState
-) -> usize {
-
-    let mut count = 0;
-    for tuple_state in tuples.iter_mut() {
-        if *tuple_state == from_state {
-            *tuple_state = to_state;
-            count += 1;
-        }
-    }
-    count
-}
-
-#[inline]
-pub fn count_matching_tuples(tuples: &[TupleState], target_state: TupleState) -> usize {
-    // Fallback to scalar implementation
-    tuples.iter().filter(|&&s| s == target_state).count()
-}
-
+pub struct SafeTupleIndex(pub(crate) DefaultKey);
 
 impl SafeTupleIndex {
+    /// Returns the underlying `DefaultKey` for this index.
     #[inline]
-    pub fn new(index: TupleIndex, generation: u64) -> Self {
-        Self { index, generation }
-    }
-    #[inline]
-    pub fn index(&self) -> TupleIndex {
-        self.index
-    }
-    #[inline]
-    pub fn generation(&self) -> u64 {
-        self.generation
+    pub fn key(&self) -> DefaultKey {
+        self.0
     }
 }
 
-/// High-performance tuple arena with optimized memory layout and safety guarantees
+/// High-performance tuple arena using `SlotMap` for memory safety and efficiency.
+/// This implementation replaces the previous combination of `generational-arena` and a custom `SparseSet`,
+/// fixing the unbounded memory growth issue in long-running sessions.
 pub struct TupleArena {
-    pub arena: Arena<AnyTuple>,
-    generation_counter: u64,
-    type_pools: HashMap<TupleArity, SmallVec<[SafeTupleIndex; 4]>>,
-    // OPTIMIZATION (Guide 2.1): Replace Vec<Option<u64>> with a SparseSet for O(1) operations.
-    active_generations: SparseSet<u64>,
+    /// The core storage for all tuples, managed by `slotmap`.
+    pub arena: SlotMap<DefaultKey, AnyTuple>,
+    /// Resource limits to prevent excessive memory usage.
     limits: ResourceLimits,
 }
 
-// Helper for likely/unlikely branch hints (Guide 2.2)
+/// Helper for marking unlikely branches for compiler optimization.
 #[inline(always)]
 #[cold]
 fn unlikely<T>(val: T) -> T {
@@ -78,241 +46,146 @@ fn unlikely<T>(val: T) -> T {
 }
 
 impl TupleArena {
+    /// Creates a new `TupleArena` with default resource limits.
     pub fn new() -> Self {
         Self::with_limits(ResourceLimits::default())
     }
 
+    /// Creates a new `TupleArena` with the specified resource limits.
     pub fn with_limits(limits: ResourceLimits) -> Self {
         Self {
-            arena: Arena::new(),
-            generation_counter: 0,
-            type_pools: HashMap::default(),
-            // OPTIMIZATION (Guide 2.1): Initialize SparseSet
-            active_generations: SparseSet::new(),
+            arena: SlotMap::new(),
             limits,
         }
     }
 
-    // OPTIMIZATION (Guide 2.2): Fast path for tuple acquisition.
-    #[inline(always)]
-    pub fn acquire_tuple_fast(&mut self, tuple: AnyTuple) -> Result<SafeTupleIndex> {
-        let current_count = self.arena.len();
-        if unlikely(current_count >= self.limits.max_tuples) {
-            return Err(GreynetError::resource_limit(
-                "max_tuples",
-                format!("Current: {}, Limit: {}", current_count, self.limits.max_tuples),
-            ));
-        }
-
-        let arity = tuple.tuple_arity();
-
-        if let Some(pool) = self.type_pools.get_mut(&arity) {
-            if let Some(safe_index) = pool.pop() {
-                let raw_index = safe_index.index.into_raw_parts().0;
-
-                // OPTIMIZATION (Guide 2.1): Use SparseSet for generation check
-                if self.active_generations.get(raw_index) == Some(safe_index.generation) {
-                    if let Some(slot) = self.arena.get_mut(safe_index.index) {
-                        *slot = tuple;
-                        return Ok(safe_index);
-                    }
-                }
-                // Return to pool on validation failure
-                pool.push(safe_index);
-            }
-        }
-
-        // Allocate new
-        self.generation_counter = self.generation_counter.wrapping_add(1);
-        let index = self.arena.insert(tuple);
-        let safe_index = SafeTupleIndex::new(index, self.generation_counter);
-        // OPTIMIZATION (Guide 2.1): Use SparseSet for insertion
-        self.active_generations
-            .insert(index.into_raw_parts().0, self.generation_counter);
-
-        Ok(safe_index)
-    }
-
-    // OPTIMIZATION (Guide 2.2): Update acquire_tuple to use the fast path.
+    /// Acquires a slot in the arena for a new tuple.
+    /// This is an O(1) operation. `SlotMap` handles recycling of removed slots internally.
     #[inline]
     pub fn acquire_tuple(&mut self, tuple: AnyTuple) -> Result<SafeTupleIndex> {
-        self.acquire_tuple_fast(tuple)
+        if unlikely(self.arena.len() >= self.limits.max_tuples) {
+            return Err(GreynetError::resource_limit(
+                "max_tuples",
+                format!("Current: {}, Limit: {}", self.arena.len(), self.limits.max_tuples),
+            ));
+        }
+        let key = self.arena.insert(tuple);
+        Ok(SafeTupleIndex(key))
     }
 
+    /// An alias for `acquire_tuple` for API consistency.
+    #[inline]
+    pub fn acquire_tuple_fast(&mut self, tuple: AnyTuple) -> Result<SafeTupleIndex> {
+        self.acquire_tuple(tuple)
+    }
+
+    /// Gets an immutable reference to a tuple if the index is valid and the slot is occupied.
     #[inline]
     pub fn get_tuple(&self, safe_index: SafeTupleIndex) -> Option<&AnyTuple> {
-        self.get_tuple_checked(safe_index).ok()
+        self.arena.get(safe_index.0)
     }
 
+    /// Gets a mutable reference to a tuple if the index is valid and the slot is occupied.
     #[inline]
     pub fn get_tuple_mut(&mut self, safe_index: SafeTupleIndex) -> Option<&mut AnyTuple> {
-        self.get_tuple_mut_checked(safe_index).ok()
+        self.arena.get_mut(safe_index.0)
     }
 
+    /// Gets an immutable reference, returning a `GreynetError` if the index is invalid or stale.
     pub fn get_tuple_checked(&self, safe_index: SafeTupleIndex) -> Result<&AnyTuple> {
-        let raw_index = safe_index.index.into_raw_parts().0;
-        // OPTIMIZATION (Guide 2.1): Use SparseSet for O(1) lookup.
-        if let Some(gen) = self.active_generations.get(raw_index) {
-            if gen == safe_index.generation {
-                return self
-                    .arena
-                    .get(safe_index.index)
-                    .ok_or_else(|| GreynetError::arena_error("Arena slot empty after generation check"));
-            }
-        }
-        Err(GreynetError::invalid_index(
-            "Invalid generation or inactive index",
-        ))
+        self.arena
+            .get(safe_index.0)
+            .ok_or_else(|| GreynetError::invalid_index("Invalid or stale tuple index"))
     }
 
+    /// Gets a mutable reference, returning a `GreynetError` if the index is invalid or stale.
     pub fn get_tuple_mut_checked(&mut self, safe_index: SafeTupleIndex) -> Result<&mut AnyTuple> {
-        let raw_index = safe_index.index.into_raw_parts().0;
-        // OPTIMIZATION (Guide 2.1): Use SparseSet for O(1) lookup.
-        if let Some(gen) = self.active_generations.get(raw_index) {
-            if gen == safe_index.generation {
-                return self
-                    .arena
-                    .get_mut(safe_index.index)
-                    .ok_or_else(|| GreynetError::arena_error("Arena slot empty after generation check"));
-            }
-        }
-        Err(GreynetError::invalid_index(
-            "Invalid generation or inactive index",
-        ))
+        self.arena
+            .get_mut(safe_index.0)
+            .ok_or_else(|| GreynetError::invalid_index("Invalid or stale tuple index"))
     }
 
+    /// Releases a tuple from the arena, making its slot available for reuse.
+    /// This is an O(1) operation.
     pub fn release_tuple(&mut self, safe_index: SafeTupleIndex) {
-        if let Ok(tuple) = self.get_tuple_mut_checked(safe_index) {
-            let arity = tuple.tuple_arity();
-            tuple.reset();
-
-            self.type_pools.entry(arity).or_default().push(safe_index);
-
-            let raw_index = safe_index.index.into_raw_parts().0;
-            // OPTIMIZATION (Guide 2.1): Use SparseSet for O(1) removal.
-            self.active_generations.remove(raw_index);
-        }
+        self.arena.remove(safe_index.0);
     }
 
+    /// In debug builds, checks for logical inconsistencies like dangling tuple states.
     #[cfg(debug_assertions)]
     pub fn check_for_leaks(&self) -> Result<()> {
-        let mut live_count = 0;
-        let mut dead_count = 0;
-        let mut dying_count = 0;
-
-        for (_, tuple) in self.arena.iter() {
-            match tuple.state() {
-                TupleState::Dead => dead_count += 1,
-                TupleState::Dying => dying_count += 1,
-                _ => live_count += 1,
-            }
-        }
-
-        let pooled_count: usize = self.type_pools.values().map(|v| v.len()).sum();
+        // With SlotMap, the primary leak vector (unbounded sparse array) is gone.
+        // This check now ensures no tuples are left in a transient "Dying" state.
+        let dying_count = self.arena.values().filter(|t| t.state() == TupleState::Dying).count();
 
         if dying_count > 0 {
             return Err(GreynetError::consistency_violation(format!(
-                "Found {} tuples in Dying state",
+                "Found {} tuples stuck in Dying state. They should have been released by the scheduler.",
                 dying_count
-            )));
-        }
-
-        if dead_count != pooled_count {
-            return Err(GreynetError::consistency_violation(format!(
-                "Inconsistency: {} dead vs {} pooled",
-                dead_count, pooled_count
             )));
         }
 
         Ok(())
     }
 
-    /// Get current memory usage estimate
+    /// Estimates the current memory usage of the tuple arena in megabytes.
     pub fn memory_usage_estimate(&self) -> usize {
         self.limits.estimate_memory_usage(self.arena.len(), 0)
     }
 
-    /// Get statistics about the arena
+    /// Gathers statistics about the current state of the arena.
     pub fn stats(&self) -> ArenaStats {
-        let mut live_count = 0;
-        let mut dead_count = 0;
-
-        for (_, tuple) in self.arena.iter() {
-            match tuple.state() {
-                TupleState::Dead => dead_count += 1,
-                _ => live_count += 1,
+        let (live_tuples, dead_tuples) = self.arena.values().fold((0, 0), |(live, dead), tuple| {
+            if tuple.state() == TupleState::Dead {
+                (live, dead + 1)
+            } else {
+                (live + 1, dead)
             }
-        }
+        });
 
         ArenaStats {
-            total_slots: self.arena.len(),
-            live_tuples: live_count,
-            dead_tuples: dead_count,
-            pooled_tuples: self.type_pools.values().map(|v| v.len()).sum(),
-            generation_counter: self.generation_counter,
+            total_slots: self.arena.capacity(),
+            live_tuples,
+            dead_tuples,
+            // These fields are no longer relevant with SlotMap but are kept for API compatibility.
+            pooled_tuples: 0,
+            generation_counter: 0,
         }
     }
 
+    /// Finds all tuples marked as 'Dying' and releases them from the arena.
     pub fn cleanup_dying_tuples(&mut self) -> usize {
-        self.cleanup_dying_tuples_scalar()
-    }
-
-    /// Scalar implementation for cleanup
-    pub fn cleanup_dying_tuples_scalar(&mut self) -> usize {
-        let mut cleaned_count = 0;
-        let mut indices_to_clean = Vec::new();
-
-        for (index, tuple) in self.arena.iter() {
-            if matches!(tuple.state(), TupleState::Dying) {
-                let raw_index = index.into_raw_parts().0;
-                if let Some(generation) = self.active_generations.get(raw_index) {
-                    indices_to_clean.push(SafeTupleIndex::new(index, generation));
-                }
-            }
+        let keys_to_clean: Vec<DefaultKey> = self.arena
+            .iter()
+            .filter(|(_, tuple)| tuple.state() == TupleState::Dying)
+            .map(|(key, _)| key)
+            .collect();
+        
+        let cleaned_count = keys_to_clean.len();
+        for key in keys_to_clean {
+            self.arena.remove(key);
         }
-
-        for safe_index in indices_to_clean {
-            self.release_tuple(safe_index);
-            cleaned_count += 1;
-        }
-
         cleaned_count
     }
 
+    /// Efficiently transitions all tuples from a given state to another.
     pub fn bulk_transition_states(&mut self, from: TupleState, to: TupleState) -> usize {
-        let mut states: Vec<TupleState> = Vec::with_capacity(self.arena.len());
-        let mut indices: Vec<SafeTupleIndex> = Vec::with_capacity(self.arena.len());
-        
-        // Collect current states
-        for (index, tuple) in self.arena.iter() {
-            states.push(tuple.state());
-            let raw_index = index.into_raw_parts().0;
-            if let Some(generation) = self.active_generations.get(raw_index) {
-                indices.push(SafeTupleIndex::new(index, generation));
+        let mut updated_count = 0;
+        for tuple in self.arena.values_mut() {
+            if tuple.state() == from {
+                tuple.set_state(to);
+                updated_count += 1;
             }
         }
-        
-        let updated_count = bulk_update_states(&mut states, from, to);
-        
-        // Apply the updates back to tuples
-        for (i, &safe_index) in indices.iter().enumerate() {
-            if i < states.len() {
-                if let Ok(tuple) = self.get_tuple_mut_checked(safe_index) {
-                    tuple.set_state(states[i]);
-                }
-            }
-        }
-        
         updated_count
     }
 
-    /// Pre-allocate tuple slots for bulk operations
+    /// Pre-allocates memory for a specified number of additional tuples.
     pub fn reserve_capacity(&mut self, additional: usize) {
         self.arena.reserve(additional);
-        self.active_generations.dense.reserve(additional);
     }
 
-    /// Estimate memory pressure and trigger cleanup if needed
+    /// Triggers a cleanup of dying tuples if memory usage exceeds a certain threshold.
     pub fn cleanup_if_memory_pressure(&mut self) -> usize {
         let memory_estimate = self.memory_usage_estimate();
         
@@ -325,6 +198,7 @@ impl TupleArena {
     }
 }
 
+/// A snapshot of `TupleArena` statistics.
 #[derive(Debug, Clone)]
 pub struct ArenaStats {
     pub total_slots: usize,
@@ -337,9 +211,8 @@ pub struct ArenaStats {
 impl std::fmt::Debug for TupleArena {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TupleArena")
-            .field("total_arena_slots", &self.arena.len())
-            .field("generation_counter", &self.generation_counter)
-            .field("active_generations_len", &self.active_generations.dense.len())
+            .field("live_tuples", &self.arena.len())
+            .field("capacity", &self.arena.capacity())
             .finish()
     }
 }
@@ -350,6 +223,7 @@ impl Default for TupleArena {
     }
 }
 
+/// Represents an operation to be performed on a node in the network.
 #[derive(Debug, Clone)]
 pub enum NodeOperation {
     Insert(NodeId, SafeTupleIndex),
@@ -361,6 +235,7 @@ pub enum NodeOperation {
     ReleaseTuple(SafeTupleIndex),
 }
 
+/// An enum that holds the data for any type of node in the network.
 #[derive(Debug)]
 pub enum NodeData<S: Score> {
     From(FromNode),
@@ -375,6 +250,7 @@ pub enum NodeData<S: Score> {
 }
 
 impl<S: Score> NodeData<S> {
+    /// Collects the operations that should be triggered by an insertion into this node.
     #[inline]
     pub fn collect_insert_ops(
         &mut self,
@@ -387,7 +263,7 @@ impl<S: Score> NodeData<S> {
             NodeData::Filter(node) => node.insert_collect_ops(tuple_index, tuples, operations),
             NodeData::Group(node) => node.insert_collect_ops(tuple_index, tuples, operations),
             NodeData::FlatMap(node) => node.insert_collect_ops(tuple_index, tuples, operations),
-            NodeData::Join(_) | NodeData::Conditional(_) => Ok(()),
+            NodeData::Join(_) | NodeData::Conditional(_) => Ok(()), // Handled by adapters
             NodeData::JoinLeftAdapter(adapter) => {
                 operations.push(NodeOperation::InsertLeft(
                     adapter.parent_join_node,
@@ -406,6 +282,7 @@ impl<S: Score> NodeData<S> {
         }
     }
 
+    /// Collects the operations that should be triggered by a retraction from this node.
     #[inline]
     pub fn collect_retract_ops(
         &mut self,
@@ -418,7 +295,7 @@ impl<S: Score> NodeData<S> {
             NodeData::Filter(node) => node.retract_collect_ops(tuple_index, tuples, operations),
             NodeData::Group(node) => node.retract_collect_ops(tuple_index, tuples, operations),
             NodeData::FlatMap(node) => node.retract_collect_ops(tuple_index, tuples, operations),
-            NodeData::Join(_) | NodeData::Conditional(_) => Ok(()),
+            NodeData::Join(_) | NodeData::Conditional(_) => Ok(()), // Handled by adapters
             NodeData::JoinLeftAdapter(adapter) => {
                 operations.push(NodeOperation::RetractLeft(
                     adapter.parent_join_node,
@@ -437,6 +314,7 @@ impl<S: Score> NodeData<S> {
         }
     }
 
+    /// Adds a child node to this node's list of children, if applicable.
     pub fn add_child(&mut self, child_id: NodeId) {
         let children = match self {
             NodeData::From(n) => &mut n.children,
@@ -445,7 +323,8 @@ impl<S: Score> NodeData<S> {
             NodeData::Conditional(n) => &mut n.children,
             NodeData::Group(n) => &mut n.children,
             NodeData::FlatMap(n) => &mut n.children,
-            NodeData::Scoring(n) => return, // Scoring nodes don't have children
+            // Scoring and Adapter nodes are terminal or have special connections
+            NodeData::Scoring(_) => return,
             NodeData::JoinLeftAdapter(_) | NodeData::JoinRightAdapter(_) => return,
         };
         if !children.contains(&child_id) {
@@ -454,7 +333,7 @@ impl<S: Score> NodeData<S> {
     }
 }
 
-/// High-performance node arena
+/// The storage arena for all nodes in the constraint network.
 pub struct NodeArena<S: Score> {
     pub(crate) nodes: SlotMap<NodeId, NodeData<S>>,
 }
@@ -486,6 +365,8 @@ impl<S: Score> NodeArena<S> {
         self.nodes.len()
     }
 
+    /// Executes a list of `NodeOperation`s, potentially creating new operations
+    /// in a cascading fashion until the network stabilizes.
     pub fn execute_operations(
         mut operations: Vec<NodeOperation>,
         nodes: &mut NodeArena<S>,
@@ -494,7 +375,7 @@ impl<S: Score> NodeArena<S> {
         let mut node_ops = Vec::with_capacity(operations.len());
         let mut release_ops = Vec::new();
 
-        // Separate node operations from release operations
+        // Separate node operations from release operations for deferred execution.
         for op in operations.drain(..) {
             match op {
                 NodeOperation::ReleaseTuple(idx) => release_ops.push(idx),
@@ -502,7 +383,7 @@ impl<S: Score> NodeArena<S> {
             }
         }
 
-        // Process node operations in batches with proper error handling
+        // Process node operations in batches.
         while !node_ops.is_empty() {
             let current_batch = std::mem::take(&mut node_ops);
             for operation in current_batch {
@@ -569,7 +450,7 @@ impl<S: Score> NodeArena<S> {
                     return Err(e);
                 }
 
-                // Queue new operations
+                // Queue new operations generated by the current batch.
                 for new_op in new_operations {
                     match new_op {
                         NodeOperation::ReleaseTuple(idx) => release_ops.push(idx),
@@ -579,7 +460,7 @@ impl<S: Score> NodeArena<S> {
             }
         }
 
-        // Release tuples at the end
+        // Release all collected tuples at the very end to avoid use-after-free issues.
         for tuple_idx in release_ops {
             tuples.release_tuple(tuple_idx);
         }

@@ -1,6 +1,7 @@
+// nodes.rs
 use super::advanced_index::AdvancedIndex;
 use super::arena::{NodeId, NodeOperation, SafeTupleIndex, TupleArena};
-use super::collectors::BaseCollector;
+use super::collectors::{BaseCollector, UndoReceipt};
 use super::joiner::JoinerType;
 use super::stream_def::CollectorSupplier;
 use super::tuple::BiTuple;
@@ -16,18 +17,21 @@ use smallvec::SmallVec;
 use std::any::TypeId;
 use std::cell::RefCell;
 use std::rc::Rc;
-use crate::collectors::UndoReceipt;
 
-// --- Function Types ---
+// --- Zero-Copy Function Type Definitions ---
 
-// Zero-Copy (new API) function types
+/// A function that extracts a hashable key from a tuple without allocations.
 pub type ZeroCopyKeyFn = Rc<dyn Fn(&dyn ZeroCopyFacts) -> u64>;
+/// A function that evaluates a tuple and returns true or false without allocations.
 pub type ZeroCopyPredicate = Rc<dyn Fn(&dyn ZeroCopyFacts) -> bool>;
+/// A function that calculates a score impact from a tuple without allocations.
 pub type ZeroCopyImpactFn<S> = Rc<dyn Fn(&dyn ZeroCopyFacts) -> S>;
+/// A function that maps a tuple to a new set of facts without allocations.
 pub type ZeroCopyMapperFn = Rc<dyn Fn(&dyn ZeroCopyFacts) -> Vec<Rc<dyn crate::fact::GreynetFact>>>;
 
-// --- Simplified Newtype Struct Wrappers ---
+// --- Newtype Wrappers for Function Types ---
 
+/// A wrapper for `ZeroCopyPredicate` for type safety and clarity.
 #[derive(Clone)]
 pub struct Predicate(pub ZeroCopyPredicate);
 
@@ -38,6 +42,7 @@ impl Predicate {
     }
 }
 
+/// A wrapper for `ZeroCopyKeyFn`.
 #[derive(Clone)]
 pub struct KeyFn(pub ZeroCopyKeyFn);
 
@@ -48,6 +53,7 @@ impl KeyFn {
     }
 }
 
+/// A wrapper for `ZeroCopyImpactFn`.
 #[derive(Clone)]
 pub struct ImpactFn<S: Score>(pub ZeroCopyImpactFn<S>);
 
@@ -58,6 +64,7 @@ impl<S: Score> ImpactFn<S> {
     }
 }
 
+/// A wrapper for `ZeroCopyMapperFn`.
 #[derive(Clone)]
 pub struct MapperFn(pub ZeroCopyMapperFn);
 
@@ -68,9 +75,9 @@ impl MapperFn {
     }
 }
 
+// --- Node Implementations ---
 
-// --- Node Definitions (Updated) ---
-
+/// The entry point for facts of a specific type into the network.
 #[derive(Debug)]
 pub struct FromNode {
     pub children: Vec<NodeId>,
@@ -112,6 +119,7 @@ impl FromNode {
     }
 }
 
+/// A node that filters tuples based on a predicate.
 pub struct FilterNode {
     pub children: Vec<NodeId>,
     pub predicate: Predicate,
@@ -169,6 +177,7 @@ impl std::fmt::Debug for FilterNode {
     }
 }
 
+/// An enum that abstracts over different index types for joins.
 #[derive(Debug)]
 pub enum JoinIndex {
     Uni(UniIndex<u64>),
@@ -208,6 +217,7 @@ impl JoinIndex {
     }
 }
 
+/// A node that combines tuples from two parent streams based on a join condition.
 pub struct JoinNode {
     pub children: Vec<NodeId>,
     pub joiner_type: JoinerType,
@@ -215,6 +225,7 @@ pub struct JoinNode {
     pub right_index: JoinIndex,
     pub left_key_fn: KeyFn,
     pub right_key_fn: KeyFn,
+    /// Stores the results of successful joins (parent tuple pairs -> child tuple).
     pub beta_memory: HashMap<PackedIndices, SafeTupleIndex>,
 }
 
@@ -320,10 +331,7 @@ impl JoinNode {
         let pairs_to_remove: SmallVec<[PackedIndices; 16]> = self
             .beta_memory
             .keys()
-            .filter(|packed| {
-                packed.left_index() == tuple_index.index.into_raw_parts().0
-                    && packed.left_generation() == tuple_index.generation
-            })
+            .filter(|packed| packed.left_key() == tuple_index.key())
             .copied()
             .collect();
 
@@ -355,10 +363,7 @@ impl JoinNode {
         let pairs_to_remove: SmallVec<[PackedIndices; 16]> = self
             .beta_memory
             .keys()
-            .filter(|packed| {
-                packed.right_index() == tuple_index.index.into_raw_parts().0
-                    && packed.right_generation() == tuple_index.generation
-            })
+            .filter(|packed| packed.right_key() == tuple_index.key())
             .copied()
             .collect();
 
@@ -389,6 +394,8 @@ impl std::fmt::Debug for JoinNode {
     }
 }
 
+/// A node that propagates tuples only if a condition (existence or non-existence
+/// of matching tuples in another stream) is met.
 pub struct ConditionalNode {
     pub children: Vec<NodeId>,
     should_exist: bool,
@@ -548,6 +555,7 @@ impl std::fmt::Debug for ConditionalNode {
     }
 }
 
+/// A node that groups tuples by a key and applies a collector to each group.
 pub struct GroupNode {
     pub children: Vec<NodeId>,
     key_fn: KeyFn,
@@ -687,6 +695,7 @@ impl std::fmt::Debug for GroupNode {
     }
 }
 
+/// A node that transforms each incoming tuple into zero or more new tuples.
 pub struct FlatMapNode {
     pub children: Vec<NodeId>,
     mapper_fn: MapperFn,
@@ -757,15 +766,13 @@ impl std::fmt::Debug for FlatMapNode {
 }
 
 
-/// Ultra-high-performance scoring node with direct accumulation
+/// A terminal node that calculates a score for each tuple that reaches it.
 pub struct ScoringNode<S: Score> {
     pub constraint_id: String,
     pub penalty_function: ImpactFn<S>,
     pub weights: Rc<RefCell<ConstraintWeights>>,
-    // OPTIMIZATION: Direct primitive accumulation instead of HashMap
     score_accumulator: S::Accumulator,
     match_count: usize,
-    // Lightweight tracking for debugging/analysis only
     active_matches: rustc_hash::FxHashSet<SafeTupleIndex>,
 }
 
@@ -785,7 +792,6 @@ impl<S: Score> ScoringNode<S> {
         }
     }
 
-    /// Ultra-fast insert with O(1) accumulation
     #[inline]
     pub fn insert_collect_ops(
         &mut self,
@@ -794,13 +800,11 @@ impl<S: Score> ScoringNode<S> {
         _operations: &mut Vec<NodeOperation>,
     ) -> Result<()> {
         if let Ok(tuple) = tuples.get_tuple_checked(tuple_index) {
-            // Ensure we don't double-count
             if self.active_matches.insert(tuple_index) {
                 let base_score = self.penalty_function.execute(tuple);
                 let weight = self.weights.borrow().get_weight(&self.constraint_id);
                 let weighted_score = base_score.mul(weight);
                 
-                // Direct O(1) accumulation - no HashMap overhead!
                 S::accumulate_into(&mut self.score_accumulator, &weighted_score);
                 self.match_count += 1;
             }
@@ -808,7 +812,6 @@ impl<S: Score> ScoringNode<S> {
         Ok(())
     }
 
-    /// Ultra-fast retract with O(1) subtraction
     #[inline]
     pub fn retract_collect_ops(
         &mut self,
@@ -816,14 +819,12 @@ impl<S: Score> ScoringNode<S> {
         tuples: &mut TupleArena,
         _operations: &mut Vec<NodeOperation>,
     ) -> Result<()> {
-        // Only process if tuple was actually a match
         if self.active_matches.remove(&tuple_index) {
             if let Ok(tuple) = tuples.get_tuple_checked(tuple_index) {
                 let base_score = self.penalty_function.execute(tuple);
                 let weight = self.weights.borrow().get_weight(&self.constraint_id);
                 let weighted_score = base_score.mul(weight);
                 
-                // Subtract by adding negative score - still O(1)!
                 let negative_score = weighted_score.mul(-1.0);
                 S::accumulate_into(&mut self.score_accumulator, &negative_score);
                 self.match_count = self.match_count.saturating_sub(1);
@@ -832,21 +833,17 @@ impl<S: Score> ScoringNode<S> {
         Ok(())
     }
 
-    /// Blazing fast total score - no iteration needed!
     #[inline]
     pub fn get_total_score(&self) -> S {
         S::from_accumulator(&self.score_accumulator)
     }
 
-    /// Optimized bulk recalculation
     pub fn recalculate_scores(&mut self, tuples: &TupleArena) -> Result<()> {
-        // Reset accumulator to zero
         S::reset_accumulator(&mut self.score_accumulator);
         self.match_count = 0;
         
         let weight = self.weights.borrow().get_weight(&self.constraint_id);
         
-        // Rebuild accumulator efficiently
         for &tuple_idx in &self.active_matches {
             if let Ok(tuple) = tuples.get_tuple_checked(tuple_idx) {
                 let base_score = self.penalty_function.execute(tuple);
@@ -858,21 +855,9 @@ impl<S: Score> ScoringNode<S> {
         Ok(())
     }
 
-    /// Bulk recalculation - same performance as regular
-    #[inline]
-    pub fn recalculate_scores_bulk(&mut self, tuples: &TupleArena) -> Result<()> {
-        self.recalculate_scores(tuples)
-    }
-
-    /// Fast accessors
     #[inline]
     pub fn match_count(&self) -> usize {
         self.match_count
-    }
-
-    #[inline]
-    pub fn has_matches(&self) -> bool {
-        self.match_count > 0
     }
 
     #[inline]
@@ -880,37 +865,9 @@ impl<S: Score> ScoringNode<S> {
         self.active_matches.contains(tuple_index)
     }
 
-    /// Get match indices iterator (for debugging/analysis)
     pub fn match_indices(&self) -> impl Iterator<Item = &SafeTupleIndex> {
         self.active_matches.iter()
     }
-    
-    /// Get current accumulator state (for debugging)
-    pub fn get_accumulator(&self) -> &S::Accumulator {
-        &self.score_accumulator
-    }
-    
-    /// Memory usage estimate
-    pub fn memory_usage_estimate(&self) -> usize {
-        std::mem::size_of::<Self>() + 
-        self.active_matches.capacity() * std::mem::size_of::<SafeTupleIndex>()
-    }
-    
-    /// Performance statistics
-    pub fn get_performance_stats(&self) -> ScoringNodeStats {
-        ScoringNodeStats {
-            match_count: self.match_count,
-            memory_usage: self.memory_usage_estimate(),
-            accumulator_size: std::mem::size_of::<S::Accumulator>(),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ScoringNodeStats {
-    pub match_count: usize,
-    pub memory_usage: usize,
-    pub accumulator_size: usize,
 }
 
 impl<S: Score> std::fmt::Debug for ScoringNode<S> {
