@@ -1,49 +1,28 @@
+![](./logos/greynet_logo.png)
 
-# Preview
+Greynet Constraint Satisfaction Engine
+======================================
 
-![](logos/greyjack-rust-long-logo.png)
+**Greynet** is a high-performance, embeddable constraint satisfaction engine for Rust, inspired by the principles of the Rete algorithm. It is designed for complex scheduling, planning, and resource allocation problems where solutions must adhere to a set of weighted, and often conflicting, constraints.
 
-_In optimum we trust._
+The engine provides a powerful and expressive fluent API to define the problem space.
+Core Features
+-------------
 
-GreyJack Solver is an AI constraint solver for Rust (current version) built on top of Polars. 
-It empowers you to solve a wide range of constraint optimization problems, including continuous, integer, and mixed-integer challenges.
+* **Fluent Constraint Builder**: Define complex rules and relationships using a chained, easy-to-read API.
 
-# Editions
+* **Flexible Scoring**: Supports multiple score types out-of-the-box (`SimpleScore`, `HardSoftScore`, `HardMediumSoftScore`) to model various levels of constraint priority.
 
-There are 2 editions of GreyJack Solver:
+* **High-Performance Internals**:
+  
+  * **Zero-Copy Operations**: Functions for filtering, joining, and scoring operate directly on tuple data without intermediate allocations.
+  
+  * **Efficient Indexing**: Utilizes specialized data structures (`UniIndex`, `AdvancedIndex`) for fast tuple lookups.
+  
+  * **Memory Safety**: Employs a generational arena (`slotmap`) for tuple and node storage, preventing memory leaks and use-after-free errors.
 
-- Rust edition.
-- [Python edition](https://github.com/CameleoGrey/greyjack-solver-python).
+* **Batch Scheduler**: A high-throughput scheduler processes insertions and retractions in batches, efficiently propagating changes through the network until it reaches a stable state.
 
-# Key Features of GreyJack Solver (Rust version)
+* **Rich Collectors**: Provides a suite of aggregation functions (`count`, `sum`, `avg`, `toList`, `toSet`, etc.) for use in `groupBy` operations.
 
-- **Great comfortability, expressiveness and flexibility** Thanks to Polars you can express almost all ideas of solutions for almost any problem. And if you need, you can describe some parts of constraints by plain Rust.
-- **Universality** Supports multiple types of constraint problems (continuous, integer, mixed-integer).
-- **Nearly linear horizontal scaling** Multi-threaded solving organized as collective work of individual agents (island computation model for all algorithms), which are sharing the results with neighbours during solving. It gives nearly linear horizontal scaling, increases quality and speed of solving (depends on agents settings and problem).
-- **Supporting of population and local search algorithms** GreyJack currently implements GeneticAlgorithm, TabuSearch, LateAcceptance.
-- **Clarity** GreyJack gives clear and straightforward approach to design, implement and improve enough effective solutions for almost any constraint problem and situation.
-- **Easy integration** Observer mechanism (see examples).
-
-# Get started with GreyJack Solver in Rust
-
-```
-cargo add greyjack
-```
-
-- Explore examples. Docs and guides will be later. GreyJack is very intuitively understandable solver (even Rust version).
-- Simply solve your tasks simply.
-
-# RoadMap
-
-- Composite termination criterion (for example: solving limit minutes N AND score not improving M seconds)
-- Add more examples: Job-Shop, Pickup&Delivery, some continuous and MIP tasks, scheduling, etc
-- Modern variations (modifications) of LSHADE (Differential evolution algorithms often appear in articles as sota approaches)
-- CMA, probably its modern variants, adaptations for tasks with integer and categorical variables (often appears in articles as sota approach)
-- Multi-level score
-- Custom moves support
-- Try to impove incremental (pseudo-incremental) score calculation mechanism (caching, no clonning, etc)
-- Write docs
-- Website
-- Useful text materials, guides, presentations
-- Tests, tests, tests...
-- Score explainer / interpreter
+* **Resource Management**: Allows setting explicit limits on memory, tuple count, and operation depth to ensure stability in resource-constrained environments.

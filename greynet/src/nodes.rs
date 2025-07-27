@@ -7,6 +7,7 @@ use super::stream_def::CollectorSupplier;
 use super::tuple::BiTuple;
 use super::uni_index::UniIndex;
 use crate::constraint::ConstraintWeights;
+use crate::constraint::ConstraintId;
 use crate::packed_indices::PackedIndices;
 use crate::score::Score;
 use crate::state::TupleState;
@@ -59,7 +60,7 @@ pub struct ImpactFn<S: Score>(pub ZeroCopyImpactFn<S>);
 
 impl<S: Score> ImpactFn<S> {
     #[inline]
-    fn execute(&self, tuple: &AnyTuple) -> S {
+    pub fn execute(&self, tuple: &AnyTuple) -> S {
         self.0(tuple)
     }
 }
@@ -247,75 +248,92 @@ impl JoinNode {
     }
 
     pub fn insert_left_collect_ops(
-        &mut self,
-        tuple_index: SafeTupleIndex,
-        tuples: &mut TupleArena,
-        operations: &mut Vec<NodeOperation>,
-    ) -> Result<()> {
-        let left_tuple = tuples.get_tuple_checked(tuple_index)?.clone();
-    
-        let key = self.left_key_fn.execute(&left_tuple);
-        self.left_index.put(key, tuple_index);
-    
-        let right_matches: SmallVec<[SafeTupleIndex; 8]> = self
-            .right_index
-            .get_matches(key, self.joiner_type.inverse())
-            .iter()
-            .copied()
-            .collect();
-    
-        if !right_matches.is_empty() {
-            operations.reserve(right_matches.len() * self.children.len());
-            for &right_match_idx in &right_matches {
-                let right_tuple = tuples.get_tuple_checked(right_match_idx)?.clone();
-                if let Ok(combined) = left_tuple.combine(&right_tuple) {
-                    let child_idx = tuples.acquire_tuple_fast(combined)?;
-                    let packed = crate::packed_indices::PackedIndices::new(tuple_index, right_match_idx);
-                    self.beta_memory.insert(packed, child_idx);
-                    for &child_id in &self.children {
-                        operations.push(NodeOperation::Insert(child_id, child_idx));
-                    }
-                }
+    &mut self,
+    tuple_index: SafeTupleIndex,
+    tuples: &mut TupleArena,
+    operations: &mut Vec<NodeOperation>,
+) -> Result<()> {
+    let left_tuple = tuples.get_tuple_checked(tuple_index)?.clone();
+
+    let key = self.left_key_fn.execute(&left_tuple);
+    self.left_index.put(key, tuple_index);
+
+    let right_matches: SmallVec<[SafeTupleIndex; 8]> = self
+        .right_index
+        .get_matches(key, self.joiner_type.inverse())
+        .iter()
+        .copied()
+        .collect();
+
+    if !right_matches.is_empty() {
+        operations.reserve(right_matches.len() * self.children.len());
+        for &right_match_idx in &right_matches {
+            // First, create the packed key for the parent tuple pair.
+            let packed = crate::packed_indices::PackedIndices::new(tuple_index, right_match_idx);
+            
+            // Before creating a child, check if one already exists for this pair.
+            // This prevents creating a duplicate if the right-side tuple was processed first.
+            if self.beta_memory.contains_key(&packed) {
+                continue; // Child already exists, do nothing.
             }
-        }
-        Ok(())
-    }
 
-    pub fn insert_right_collect_ops(
-        &mut self,
-        tuple_index: SafeTupleIndex,
-        tuples: &mut TupleArena,
-        operations: &mut Vec<NodeOperation>,
-    ) -> Result<()> {
-        let right_tuple = tuples.get_tuple_checked(tuple_index)?.clone();
-
-        let key = self.right_key_fn.execute(&right_tuple);
-        self.right_index.put(key, tuple_index);
-
-        let left_matches: SmallVec<[SafeTupleIndex; 8]> = self
-            .left_index
-            .get_matches(key, self.joiner_type)
-            .iter()
-            .copied()
-            .collect();
-
-        if !left_matches.is_empty() {
-            operations.reserve(left_matches.len() * self.children.len());
-        }
-
-        for &left_match_idx in &left_matches {
-            let left_tuple = tuples.get_tuple_checked(left_match_idx)?.clone();
+            let right_tuple = tuples.get_tuple_checked(right_match_idx)?.clone();
             if let Ok(combined) = left_tuple.combine(&right_tuple) {
                 let child_idx = tuples.acquire_tuple_fast(combined)?;
-                let packed = PackedIndices::new(left_match_idx, tuple_index);
+                // Use the 'packed' key we created earlier.
                 self.beta_memory.insert(packed, child_idx);
                 for &child_id in &self.children {
                     operations.push(NodeOperation::Insert(child_id, child_idx));
                 }
             }
         }
-        Ok(())
     }
+    Ok(())
+}
+
+pub fn insert_right_collect_ops(
+    &mut self,
+    tuple_index: SafeTupleIndex,
+    tuples: &mut TupleArena,
+    operations: &mut Vec<NodeOperation>,
+) -> Result<()> {
+    let right_tuple = tuples.get_tuple_checked(tuple_index)?.clone();
+
+    let key = self.right_key_fn.execute(&right_tuple);
+    self.right_index.put(key, tuple_index);
+
+    let left_matches: SmallVec<[SafeTupleIndex; 8]> = self
+        .left_index
+        .get_matches(key, self.joiner_type)
+        .iter()
+        .copied()
+        .collect();
+
+    if !left_matches.is_empty() {
+        operations.reserve(left_matches.len() * self.children.len());
+    }
+
+    for &left_match_idx in &left_matches {
+        // Create the packed key for the parent tuple pair.
+        let packed = PackedIndices::new(left_match_idx, tuple_index);
+
+        // Check if a child already exists for this pair to prevent duplicates.
+        if self.beta_memory.contains_key(&packed) {
+            continue; // Child already exists, do nothing.
+        }
+
+        let left_tuple = tuples.get_tuple_checked(left_match_idx)?.clone();
+        if let Ok(combined) = left_tuple.combine(&right_tuple) {
+            let child_idx = tuples.acquire_tuple_fast(combined)?;
+            // Use the 'packed' key we created earlier.
+            self.beta_memory.insert(packed, child_idx);
+            for &child_id in &self.children {
+                operations.push(NodeOperation::Insert(child_id, child_idx));
+            }
+        }
+    }
+    Ok(())
+}
 
     pub fn retract_left_collect_ops(
         &mut self,
@@ -768,7 +786,8 @@ impl std::fmt::Debug for FlatMapNode {
 
 /// A terminal node that calculates a score for each tuple that reaches it.
 pub struct ScoringNode<S: Score> {
-    pub constraint_id: String,
+    /// MODIFIED: Uses the integer-based ConstraintId for fast lookups.
+    pub constraint_id: ConstraintId,
     pub penalty_function: ImpactFn<S>,
     pub weights: Rc<RefCell<ConstraintWeights>>,
     score_accumulator: S::Accumulator,
@@ -777,8 +796,9 @@ pub struct ScoringNode<S: Score> {
 }
 
 impl<S: Score> ScoringNode<S> {
+    /// MODIFIED: The constructor now accepts the performant `ConstraintId`.
     pub fn new(
-        constraint_id: String,
+        constraint_id: ConstraintId,
         penalty_function: ImpactFn<S>,
         weights: Rc<RefCell<ConstraintWeights>>,
     ) -> Self {
@@ -802,7 +822,9 @@ impl<S: Score> ScoringNode<S> {
         if let Ok(tuple) = tuples.get_tuple_checked(tuple_index) {
             if self.active_matches.insert(tuple_index) {
                 let base_score = self.penalty_function.execute(tuple);
-                let weight = self.weights.borrow().get_weight(&self.constraint_id);
+                // MODIFIED: get_weight is now called with the cheap-to-copy ConstraintId.
+                // This avoids string hashing and comparison in the critical path.
+                let weight = self.weights.borrow().get_weight(self.constraint_id);
                 let weighted_score = base_score.mul(weight);
                 
                 S::accumulate_into(&mut self.score_accumulator, &weighted_score);
@@ -822,7 +844,8 @@ impl<S: Score> ScoringNode<S> {
         if self.active_matches.remove(&tuple_index) {
             if let Ok(tuple) = tuples.get_tuple_checked(tuple_index) {
                 let base_score = self.penalty_function.execute(tuple);
-                let weight = self.weights.borrow().get_weight(&self.constraint_id);
+                // MODIFIED: get_weight is now called with the cheap-to-copy ConstraintId.
+                let weight = self.weights.borrow().get_weight(self.constraint_id);
                 let weighted_score = base_score.mul(weight);
                 
                 let negative_score = weighted_score.mul(-1.0);
@@ -842,7 +865,8 @@ impl<S: Score> ScoringNode<S> {
         S::reset_accumulator(&mut self.score_accumulator);
         self.match_count = 0;
         
-        let weight = self.weights.borrow().get_weight(&self.constraint_id);
+        // MODIFIED: get_weight is now called with the cheap-to-copy ConstraintId.
+        let weight = self.weights.borrow().get_weight(self.constraint_id);
         
         for &tuple_idx in &self.active_matches {
             if let Ok(tuple) = tuples.get_tuple_checked(tuple_idx) {

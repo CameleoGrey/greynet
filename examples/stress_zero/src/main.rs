@@ -1,9 +1,10 @@
 use greynet::prelude::*;
-use greynet::tuple::{AnyTuple, ZeroCopyFacts}; // Import necessary tuple traits
-use greynet::{Collectors};
+use greynet::tuple::ZeroCopyFacts; // Import the necessary zero-copy trait
+use greynet::Collectors;
 use std::any::Any;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::rc::Rc;
 use std::time::Instant;
 use uuid::Uuid;
 use rand::prelude::*;
@@ -63,7 +64,7 @@ impl Hash for Transaction {
 
 impl Eq for Transaction {} // Marker trait
 
-// --- GreynetFact Implementations (Unchanged for Customer, SecurityAlert) ---
+// --- GreynetFact Implementations (Unchanged) ---
 
 impl GreynetFact for Customer {
     fn fact_id(&self) -> Uuid {
@@ -150,7 +151,7 @@ impl GreynetFact for SecurityAlert {
 }
 
 
-// --- Modern API Constraint Definitions ---
+// --- Modern API Constraint Definitions (Rewritten) ---
 
 fn build_constraints() -> Result<Session<SimpleScore>> {
     // Setup with optimized limits
@@ -169,9 +170,8 @@ fn build_constraints() -> Result<Session<SimpleScore>> {
     builder.add_constraint("high_value_transaction", 1.0)
         .for_each::<Transaction>()
         .filter(|tx: &Transaction| tx.amount > 45000.0)
-        .penalize("high_value_transaction", |tuple: &AnyTuple| {
+        .penalize(|tuple: &dyn ZeroCopyFacts| { // MODIFIED: Removed string ID, updated closure signature
             let tx = extract_fact::<Transaction>(tuple, 0).unwrap();
-            //tx.print_amount();
             SimpleScore::new(tx.amount / 1000.0)
         });
 
@@ -186,7 +186,7 @@ fn build_constraints() -> Result<Session<SimpleScore>> {
             extract_fact::<usize>(tuple, 1)
                  .map_or(false, |count| *count > 25)
         })
-        .penalize("excessive_transactions_per_customer", |tuple: &AnyTuple| {
+        .penalize(|tuple: &dyn ZeroCopyFacts| { // MODIFIED: Removed string ID, updated closure signature
             // The tuple is a BiTuple<(u64_key, usize_count)>.
             let count = extract_fact::<usize>(tuple, 1).unwrap();
             SimpleScore::new((*count as f64 - 25.0) * 10.0)
@@ -204,7 +204,7 @@ fn build_constraints() -> Result<Session<SimpleScore>> {
             |tx: &Transaction| tx.location.clone(),
             |alert: &SecurityAlert| alert.location.clone(),
         )
-        .penalize("transaction_in_alerted_location", |tuple: &AnyTuple| {
+        .penalize(|tuple: &dyn ZeroCopyFacts| { // MODIFIED: Updated closure signature
             // The tuple is a BiTuple<(Transaction, SecurityAlert)>.
             let alert = extract_fact::<SecurityAlert>(tuple, 1).unwrap();
             SimpleScore::new(100.0 * alert.severity as f64)
@@ -219,7 +219,7 @@ fn build_constraints() -> Result<Session<SimpleScore>> {
             |c: &Customer| c.id,
             |tx: &Transaction| tx.customer_id,
         )
-        .penalize("inactive_customer_transaction", |_| SimpleScore::new(500.0));
+        .penalize(|_| SimpleScore::new(500.0)); // MODIFIED: Removed string ID
 
     // Constraint 5: Penalize transactions from high-risk customers in locations *without* alerts.
     builder.add_constraint("high_risk_transaction_without_alert", 1.0)
@@ -232,12 +232,13 @@ fn build_constraints() -> Result<Session<SimpleScore>> {
         )
         // After the join, the stream contains (Customer, Transaction) tuples.
         // We check for the non-existence of an alert based on the transaction's location.
-        .if_not_exists_bi(
+        .if_not_exists_on_indexed( // MODIFIED: Replaced `if_not_exists_bi` with `if_not_exists_on_indexed`
             alerts_stream.clone(), // Reuse the alerts stream
-            |tx: &Transaction| tx.location.clone(), // Key from the second fact (Transaction) of the incoming stream
+            1,                     // Index of Transaction in the (Customer, Transaction) stream
+            |tx: &Transaction| tx.location.clone(), // Key from the second fact (Transaction)
             |alert: &SecurityAlert| alert.location.clone(), // Key from the "other" stream
         )
-        .penalize("high_risk_transaction_without_alert", |_| SimpleScore::new(1000.0));
+        .penalize(|_| SimpleScore::new(1000.0)); // MODIFIED: Removed string ID
 
     // Build the session from all the defined constraints.
     builder.build()
@@ -250,7 +251,7 @@ fn generate_data(
     num_transactions: usize,
     num_locations: usize,
 ) -> (Vec<Customer>, Vec<Transaction>, Vec<SecurityAlert>) {
-    let mut rng = rand::rng();
+    let mut rng = rand::thread_rng();
 
     // Generate locations
     let locations: Vec<String> = (0..num_locations)
@@ -261,12 +262,12 @@ fn generate_data(
     let customers: Vec<Customer> = (0..num_customers)
         .map(|i| Customer {
             id: i as i32,
-            risk_level: match rng.random_range(0..3) {
+            risk_level: match rng.gen_range(0..3) {
                 0 => RiskLevel::Low,
                 1 => RiskLevel::Medium,
                 _ => RiskLevel::High,
             },
-            status: if rng.random_bool(0.95) {
+            status: if rng.gen_bool(0.95) {
                 CustomerStatus::Active
             } else {
                 CustomerStatus::Inactive
@@ -278,9 +279,9 @@ fn generate_data(
     let transactions: Vec<Transaction> = (0..num_transactions)
         .map(|i| Transaction {
             id: i as i32,
-            customer_id: rng.random_range(0..num_customers) as i32,
-            amount: rng.random_range(1.0..500000.0), // Amount in dollars
-            location: locations[rng.random_range(0..locations.len())].clone(),
+            customer_id: rng.gen_range(0..num_customers) as i32,
+            amount: rng.gen_range(1.0..500000.0), // Amount in dollars
+            location: locations[rng.gen_range(0..locations.len())].clone(),
         })
         .collect();
 
@@ -291,14 +292,14 @@ fn generate_data(
         .into_iter()
         .map(|loc| SecurityAlert {
             location: loc.clone(),
-            severity: rng.random_range(1..=5),
+            severity: rng.gen_range(1..=5),
         })
         .collect();
 
     (customers, transactions, alerts)
 }
 
-// --- Performance Testing (Updated to call new build function) ---
+// --- Performance Testing (Unchanged) ---
 
 fn run_performance_benchmark() -> Result<()> {
     println!("### Starting Modern Fluent API Performance Test ###");
@@ -391,7 +392,6 @@ fn run_performance_benchmark() -> Result<()> {
     println!("│ Total Arena Slots               │ {:>19} │", format!("{:}", stats.arena_stats.total_slots));
     println!("│ Live Tuples                     │ {:>19} │", format!("{:}", stats.arena_stats.live_tuples));
     println!("│ Dead/Pooled Tuples              │ {:>19} │", format!("{:}", stats.arena_stats.dead_tuples));
-    println!("│ Generation Counter              │ {:>19} │", format!("{:}", stats.arena_stats.generation_counter));
     println!("└─────────────────────────────────┴─────────────────────┘");
 
     println!("\n🎯 Constraint Results:");
