@@ -280,7 +280,7 @@ fn generate_data(
         .map(|i| Transaction {
             id: i as i32,
             customer_id: rng.gen_range(0..num_customers) as i32,
-            amount: rng.gen_range(1.0..500000.0), // Amount in dollars
+            amount: rng.gen_range(1.0..50000.0), // Amount in dollars
             location: locations[rng.gen_range(0..locations.len())].clone(),
         })
         .collect();
