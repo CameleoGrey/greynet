@@ -541,3 +541,4 @@ impl<S: Score + 'static> Stream<Arity5, S> {
         self.flat_map_flex(mapper)
     }
 }
+
