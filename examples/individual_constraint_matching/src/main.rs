@@ -1,96 +1,60 @@
-// examples/fact_constraint_matching.rs
-// Demonstrates the new fluent API for constraint definition and detailed violation reporting.
-//
-// Key changes from the previous version:
-// 1. Uses `builder.add_constraint("name", weight).for_each::<T>()` to start a constraint definition.
-//    This is the new, recommended fluent API.
-// 2. The `.penalize()` method no longer takes a constraint name, as it's inferred from the builder context.
-// 3. Joins between streams of different arities (e.g., Arity 1 and Arity 2) are handled
-//    with the new `join_on_indexed` method.
-// 4. The logic of each constraint remains the same, but the implementation is cleaner.
-// 5. Adds a new detailed report showing all violations grouped by the individual facts involved.
-
 use greynet::prelude::*;
 use greynet::collectors;
 use greynet::FactIterator; // Explicit import for clarity
-use std::rc::Rc;
-use uuid::Uuid;
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::any::Any;
 
-// Wrapper type for Uuid to implement GreynetFact, avoiding orphan rules.
-// In a real application, the `GreynetFact for Uuid` implementation from the library would be used.
+// --- ID Generation ---
+// A simple atomic counter to generate unique i64 IDs for our facts.
+static NEXT_ID: AtomicI64 = AtomicI64::new(1);
+fn get_next_id() -> i64 {
+    NEXT_ID.fetch_add(1, Ordering::SeqCst)
+}
+
+// Wrapper type for i64 to represent a Person's ID, implementing GreynetFact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct PersonId(Uuid);
+struct PersonId(i64);
 
 impl PersonId {
     fn new() -> Self {
-        Self(Uuid::new_v4())
+        Self(get_next_id())
     }
     
-    fn inner(&self) -> Uuid {
+    fn inner(&self) -> i64 {
         self.0
     }
 }
 
-impl GreynetFact for PersonId {
-    fn fact_id(&self) -> Uuid { self.0 }
-    fn clone_fact(&self) -> Box<dyn GreynetFact> { Box::new(*self) }
-    fn as_any(&self) -> &dyn std::any::Any { self }
-    
-    fn hash_fact(&self) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        self.0.hash(&mut hasher);
-        hasher.finish()
-    }
-    
-    fn eq_fact(&self, other: &dyn GreynetFact) -> bool {
-        other.as_any().downcast_ref::<PersonId>().map_or(false, |other_id| self.0 == other_id.0)
-    }
-}
-
 // --- Domain Objects ---
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 struct Person {
     id: PersonId,
     name: String,
     age: u32,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 struct Assignment {
-    id: Uuid,
+    id: i64,
     person_id: PersonId,
     task: String,
     hours: u32,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 struct Skill {
-    id: Uuid,
+    id: i64,
     person_id: PersonId,
     skill_name: String,
     level: u32,
 }
 
-// --- GreynetFact Implementations ---
-impl GreynetFact for Person {
-    fn fact_id(&self) -> Uuid { self.id.inner() }
-    fn clone_fact(&self) -> Box<dyn GreynetFact> { Box::new(self.clone()) }
-    fn as_any(&self) -> &dyn std::any::Any { self }
-}
-
-impl GreynetFact for Assignment {
-    fn fact_id(&self) -> Uuid { self.id }
-    fn clone_fact(&self) -> Box<dyn GreynetFact> { Box::new(self.clone()) }
-    fn as_any(&self) -> &dyn std::any::Any { self }
-}
-
-impl GreynetFact for Skill {
-    fn fact_id(&self) -> Uuid { self.id }
-    fn clone_fact(&self) -> Box<dyn GreynetFact> { Box::new(self.clone()) }
-    fn as_any(&self) -> &dyn std::any::Any { self }
-}
+greynet::greynet_fact_for_struct!(PersonId);
+greynet::greynet_fact_for_struct!(Person);
+greynet::greynet_fact_for_struct!(Assignment);
+greynet::greynet_fact_for_struct!(Skill);
 
 fn main() -> Result<()> {
     // 1. Create a constraint builder
@@ -189,12 +153,12 @@ fn main() -> Result<()> {
 
     session.insert_batch([john.clone(), jane.clone(), mike.clone()])?;
 
-    let john_programming = Skill { id: Uuid::new_v4(), person_id: john.id, skill_name: "Programming".to_string(), level: 2 };
-    let jane_programming = Skill { id: Uuid::new_v4(), person_id: jane.id, skill_name: "Programming".to_string(), level: 5 };
+    let john_programming = Skill { id: get_next_id(), person_id: john.id, skill_name: "Programming".to_string(), level: 2 };
+    let jane_programming = Skill { id: get_next_id(), person_id: jane.id, skill_name: "Programming".to_string(), level: 5 };
     session.insert_batch([john_programming.clone(), jane_programming.clone()])?;
 
-    let john_assignment1 = Assignment { id: Uuid::new_v4(), person_id: john.id, task: "Senior Programming Project".to_string(), hours: 25 };
-    let john_assignment2 = Assignment { id: Uuid::new_v4(), person_id: john.id, task: "Junior Task".to_string(), hours: 20 };
+    let john_assignment1 = Assignment { id: get_next_id(), person_id: john.id, task: "Senior Programming Project".to_string(), hours: 25 };
+    let john_assignment2 = Assignment { id: get_next_id(), person_id: john.id, task: "Junior Task".to_string(), hours: 20 };
     session.insert_batch([john_assignment1.clone(), john_assignment2.clone()])?;
 
     // 4. Flush to evaluate constraints and get results
@@ -221,17 +185,11 @@ fn main() -> Result<()> {
     let all_violations_report = session.get_all_fact_constraint_matches()?;
     
     // Create a lookup map for more readable names in the output
-    let fact_lookup: HashMap<Uuid, String> = [
+    let fact_lookup: HashMap<i64, String> = [
         (john.fact_id(), john.name.clone()),
         (jane.fact_id(), jane.name.clone()),
         (mike.fact_id(), mike.name.clone()),
-        //(john_assignment1.fact_id(), "John's Senior Assignment (25h)".to_string()),
-        //(john_assignment2.fact_id(), "John's Junior Task (20h)".to_string()),
-        //(john_programming.fact_id(), "John's Programming Skill (Lvl 2)".to_string()),
-        //(jane_programming.fact_id(), "Jane's Programming Skill (Lvl 5)".to_string()),
     ].iter().cloned().collect();
-
-    //println!("Found violations involving {} distinct facts.\n", all_violations_report.total_involved_facts);
 
     for (fact_id, violations) in all_violations_report.matches_by_fact {
         let fact_name = fact_lookup.get(&fact_id).cloned().unwrap_or_else(|| fact_id.to_string());

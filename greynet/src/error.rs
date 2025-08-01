@@ -3,7 +3,6 @@
 
 use std::fmt;
 use thiserror::Error;
-use uuid::Uuid;
 
 /// Result type alias for Greynet operations
 pub type Result<T> = std::result::Result<T, GreynetError>;
@@ -12,10 +11,10 @@ pub type Result<T> = std::result::Result<T, GreynetError>;
 #[derive(Debug, Error)]
 pub enum GreynetError {
     #[error("Fact with ID {0} already exists")]
-    DuplicateFact(Uuid),
+    DuplicateFact(i64),
     
     #[error("Fact with ID {0} not found")]
-    FactNotFound(Uuid),
+    FactNotFound(i64),
     
     #[error("No from node registered for type {type_name}")]
     UnregisteredType { type_name: String },
@@ -58,11 +57,11 @@ pub enum GreynetError {
 }
 
 impl GreynetError {
-    pub fn duplicate_fact(id: Uuid) -> Self {
+    pub fn duplicate_fact(id: i64) -> Self {
         Self::DuplicateFact(id)
     }
     
-    pub fn fact_not_found(id: Uuid) -> Self {
+    pub fn fact_not_found(id: i64) -> Self {
         Self::FactNotFound(id)
     }
     

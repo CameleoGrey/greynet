@@ -12,7 +12,6 @@ use std::any::TypeId;
 use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::rc::Rc;
-use uuid::Uuid;
 
 /// Information about a constraint violation involving a specific fact.
 #[derive(Debug, Clone)]
@@ -35,7 +34,7 @@ pub enum FactRole {
 /// A comprehensive report of all constraint violations, organized by fact.
 #[derive(Debug, Clone)]
 pub struct FactConstraintReport<S: Score> {
-    pub matches_by_fact: HashMap<Uuid, Vec<FactConstraintMatch<S>>>,
+    pub matches_by_fact: HashMap<i64, Vec<FactConstraintMatch<S>>>,
     pub total_involved_facts: usize,
     pub total_violations: usize,
 }
@@ -56,7 +55,7 @@ pub struct Session<S: Score> {
     pub nodes: NodeArena<S>,
     pub tuples: TupleArena,
     scheduler: BatchScheduler,
-    fact_to_tuple_map: HashMap<uuid::Uuid, SafeTupleIndex>,
+    fact_to_tuple_map: HashMap<i64, SafeTupleIndex>,
     from_nodes: HashMap<TypeId, NodeId>,
     scoring_nodes: Vec<NodeId>,
     weights: Rc<RefCell<ConstraintWeights>>,
@@ -70,7 +69,7 @@ impl<S: Score + 'static> Session<S> {
         nodes: NodeArena<S>,
         tuples: TupleArena,
         scheduler: BatchScheduler,
-        fact_to_tuple_map: HashMap<uuid::Uuid, SafeTupleIndex>,
+        fact_to_tuple_map: HashMap<i64, SafeTupleIndex>,
         from_nodes: HashMap<TypeId, NodeId>,
         scoring_nodes: Vec<NodeId>,
         weights: Rc<RefCell<ConstraintWeights>>,
@@ -224,7 +223,7 @@ impl<S: Score + 'static> Session<S> {
     }
 
     /// Retrieves all constraint violations that involve a specific fact, including score impact.
-    pub fn get_fact_constraint_matches(&mut self, fact_id: Uuid) -> Result<Vec<FactConstraintMatch<S>>> {
+    pub fn get_fact_constraint_matches(&mut self, fact_id: i64) -> Result<Vec<FactConstraintMatch<S>>> {
         self.flush()?;
         let mut matches = Vec::new();
         let weights_ref = self.weights.borrow();
@@ -256,7 +255,7 @@ impl<S: Score + 'static> Session<S> {
     }
 
     /// Helper function to find a fact within a tuple and determine its role.
-    fn find_fact_in_tuple(&self, tuple: &AnyTuple, target_fact_id: Uuid) -> Option<FactRole> {
+    fn find_fact_in_tuple(&self, tuple: &AnyTuple, target_fact_id: i64) -> Option<FactRole> {
         for (index, fact) in tuple.facts_iter().enumerate() {
             if fact.fact_id() == target_fact_id {
                 return Some(if tuple.arity() == 1 {
@@ -281,7 +280,7 @@ impl<S: Score + 'static> Session<S> {
     pub fn get_all_fact_constraint_matches(&mut self) -> Result<FactConstraintReport<S>> {
         self.flush()?;
 
-        let mut matches_by_fact: HashMap<Uuid, Vec<FactConstraintMatch<S>>> = HashMap::default();
+        let mut matches_by_fact: HashMap<i64, Vec<FactConstraintMatch<S>>> = HashMap::default();
         let mut total_violations = 0;
         let weights_ref = self.weights.borrow();
 
@@ -327,10 +326,10 @@ impl<S: Score + 'static> Session<S> {
     }
     
     /// Retrieves constraint matches only for facts directly inserted by the user.
-    pub fn get_inserted_fact_constraint_matches(&mut self) -> Result<HashMap<Uuid, Vec<FactConstraintMatch<S>>>> {
+    pub fn get_inserted_fact_constraint_matches(&mut self) -> Result<HashMap<i64, Vec<FactConstraintMatch<S>>>> {
         self.flush()?;
-        let mut matches_by_fact: HashMap<Uuid, Vec<FactConstraintMatch<S>>> = HashMap::default();
-        let fact_ids: Vec<Uuid> = self.fact_to_tuple_map.keys().copied().collect();
+        let mut matches_by_fact: HashMap<i64, Vec<FactConstraintMatch<S>>> = HashMap::default();
+        let fact_ids: Vec<i64> = self.fact_to_tuple_map.keys().copied().collect();
         for fact_id in fact_ids {
             let fact_matches = self.get_fact_constraint_matches(fact_id)?;
             if !fact_matches.is_empty() {
@@ -341,21 +340,21 @@ impl<S: Score + 'static> Session<S> {
     }
 
     /// Checks if a specific fact is currently involved in any constraint violations.
-    pub fn is_fact_violating_constraints(&mut self, fact_id: Uuid) -> Result<bool> {
+    pub fn is_fact_violating_constraints(&mut self, fact_id: i64) -> Result<bool> {
         let matches = self.get_fact_constraint_matches(fact_id)?;
         Ok(!matches.is_empty())
     }
 
     /// Gets the count of constraint violations involving a specific fact.
-    pub fn get_fact_violation_count(&mut self, fact_id: Uuid) -> Result<usize> {
+    pub fn get_fact_violation_count(&mut self, fact_id: i64) -> Result<usize> {
         let matches = self.get_fact_constraint_matches(fact_id)?;
         Ok(matches.len())
     }
 
     /// Gets the facts that are involved in the most constraint violations.
-    pub fn get_most_problematic_facts(&mut self, limit: usize) -> Result<Vec<(Uuid, usize)>> {
+    pub fn get_most_problematic_facts(&mut self, limit: usize) -> Result<Vec<(i64, usize)>> {
         let report = self.get_all_fact_constraint_matches()?;
-        let mut fact_violation_counts: Vec<(Uuid, usize)> = report
+        let mut fact_violation_counts: Vec<(i64, usize)> = report
             .matches_by_fact
             .into_iter()
             .map(|(fact_id, matches)| (fact_id, matches.len()))

@@ -11,7 +11,7 @@ use uuid::Uuid;
 /// The trait is object-safe to allow storage in `Rc<dyn GreynetFact>`.
 pub trait GreynetFact: Debug + 'static {
     /// Returns a unique identifier for the fact instance.
-    fn fact_id(&self) -> Uuid;
+    fn fact_id(&self) -> i64;
     /// Creates a boxed clone of the fact.
     fn clone_fact(&self) -> Box<dyn GreynetFact>;
     /// Provides a hash for the fact, defaulting to hashing the `fact_id`.
@@ -46,7 +46,7 @@ pub mod fact_utils {
     /// Create a hash-compatible wrapper for trait objects
     #[derive(Hash, PartialEq, Eq, Clone)]
     pub struct FactKey {
-        pub id: uuid::Uuid,
+        pub id: i64,
         pub hash: u64,
     }
 

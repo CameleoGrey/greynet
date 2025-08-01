@@ -4,19 +4,10 @@ use greynet::Collectors;
 use std::any::Any;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::rc::Rc;
 use std::time::Instant;
-use uuid::Uuid;
 use rand::prelude::*;
 
 // --- Fact Definitions (Unchanged) ---
-
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub struct Customer {
-    pub id: i32,
-    pub risk_level: RiskLevel,
-    pub status: CustomerStatus,
-}
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum RiskLevel {
@@ -31,18 +22,19 @@ pub enum CustomerStatus {
     Inactive,
 }
 
-#[derive(Debug, Clone, PartialEq)] // Removed Hash and Eq from derive
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct Customer {
+    pub id: i32,
+    pub risk_level: RiskLevel,
+    pub status: CustomerStatus,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Transaction {
     pub id: i32,
     pub customer_id: i32,
     pub amount: f64, // Amount in dollars
     pub location: String,
-}
-
-impl Transaction {
-    pub fn print_amount(&self) {
-        println!("{}", self.amount);
-    }
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -52,6 +44,12 @@ pub struct SecurityAlert {
 }
 
 // --- Manual Implementations for Transaction due to f64 ---
+
+impl Transaction {
+    pub fn print_amount(&self) {
+        println!("{}", self.amount);
+    }
+}
 
 impl Hash for Transaction {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -64,94 +62,12 @@ impl Hash for Transaction {
 
 impl Eq for Transaction {} // Marker trait
 
-// --- GreynetFact Implementations (Unchanged) ---
-
-impl GreynetFact for Customer {
-    fn fact_id(&self) -> Uuid {
-        let mut hasher = DefaultHasher::new();
-        self.hash(&mut hasher);
-        let hash_val = hasher.finish();
-        let namespace = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
-        Uuid::new_v5(&namespace, &hash_val.to_be_bytes())
-    }
-
-    fn clone_fact(&self) -> Box<dyn GreynetFact> {
-        Box::new(self.clone())
-    }
-
-    fn eq_fact(&self, other: &dyn GreynetFact) -> bool {
-        other.as_any().downcast_ref::<Customer>().map_or(false, |c| c == self)
-    }
-
-    fn hash_fact(&self) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        self.hash(&mut hasher);
-        hasher.finish()
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-impl GreynetFact for Transaction {
-    fn fact_id(&self) -> Uuid {
-        let mut hasher = DefaultHasher::new();
-        self.hash(&mut hasher); // Uses the manual Hash impl
-        let hash_val = hasher.finish();
-        let namespace = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
-        Uuid::new_v5(&namespace, &hash_val.to_be_bytes())
-    }
-
-    fn clone_fact(&self) -> Box<dyn GreynetFact> {
-        Box::new(self.clone())
-    }
-
-    fn eq_fact(&self, other: &dyn GreynetFact) -> bool {
-        other.as_any().downcast_ref::<Transaction>().map_or(false, |t| self == t)
-    }
-
-    fn hash_fact(&self) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        self.hash(&mut hasher); // Uses the manual Hash impl
-        hasher.finish()
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-impl GreynetFact for SecurityAlert {
-    fn fact_id(&self) -> Uuid {
-        let mut hasher = DefaultHasher::new();
-        self.hash(&mut hasher);
-        let hash_val = hasher.finish();
-        let namespace = Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
-        Uuid::new_v5(&namespace, &hash_val.to_be_bytes())
-    }
-
-    fn clone_fact(&self) -> Box<dyn GreynetFact> {
-        Box::new(self.clone())
-    }
-
-    fn eq_fact(&self, other: &dyn GreynetFact) -> bool {
-        other.as_any().downcast_ref::<SecurityAlert>().map_or(false, |a| a == self)
-    }
-
-    fn hash_fact(&self) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        self.hash(&mut hasher);
-        hasher.finish()
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
+greynet::greynet_fact_for_struct!(Customer);
+greynet::greynet_fact_for_struct!(Transaction);
+greynet::greynet_fact_for_struct!(SecurityAlert);
 
 
-// --- Modern API Constraint Definitions (Rewritten) ---
+// --- Modern API Constraint Definitions (Unchanged) ---
 
 fn build_constraints() -> Result<Session<SimpleScore>> {
     // Setup with optimized limits
@@ -170,7 +86,7 @@ fn build_constraints() -> Result<Session<SimpleScore>> {
     builder.add_constraint("high_value_transaction", 1.0)
         .for_each::<Transaction>()
         .filter(|tx: &Transaction| tx.amount > 45000.0)
-        .penalize(|tuple: &dyn ZeroCopyFacts| { // MODIFIED: Removed string ID, updated closure signature
+        .penalize(|tuple: &dyn ZeroCopyFacts| {
             let tx = extract_fact::<Transaction>(tuple, 0).unwrap();
             SimpleScore::new(tx.amount / 1000.0)
         });
@@ -186,7 +102,7 @@ fn build_constraints() -> Result<Session<SimpleScore>> {
             extract_fact::<usize>(tuple, 1)
                  .map_or(false, |count| *count > 25)
         })
-        .penalize(|tuple: &dyn ZeroCopyFacts| { // MODIFIED: Removed string ID, updated closure signature
+        .penalize(|tuple: &dyn ZeroCopyFacts| {
             // The tuple is a BiTuple<(u64_key, usize_count)>.
             let count = extract_fact::<usize>(tuple, 1).unwrap();
             SimpleScore::new((*count as f64 - 25.0) * 10.0)
@@ -204,7 +120,7 @@ fn build_constraints() -> Result<Session<SimpleScore>> {
             |tx: &Transaction| tx.location.clone(),
             |alert: &SecurityAlert| alert.location.clone(),
         )
-        .penalize(|tuple: &dyn ZeroCopyFacts| { // MODIFIED: Updated closure signature
+        .penalize(|tuple: &dyn ZeroCopyFacts| {
             // The tuple is a BiTuple<(Transaction, SecurityAlert)>.
             let alert = extract_fact::<SecurityAlert>(tuple, 1).unwrap();
             SimpleScore::new(100.0 * alert.severity as f64)
@@ -219,7 +135,7 @@ fn build_constraints() -> Result<Session<SimpleScore>> {
             |c: &Customer| c.id,
             |tx: &Transaction| tx.customer_id,
         )
-        .penalize(|_| SimpleScore::new(500.0)); // MODIFIED: Removed string ID
+        .penalize(|_| SimpleScore::new(500.0));
 
     // Constraint 5: Penalize transactions from high-risk customers in locations *without* alerts.
     builder.add_constraint("high_risk_transaction_without_alert", 1.0)
@@ -232,13 +148,13 @@ fn build_constraints() -> Result<Session<SimpleScore>> {
         )
         // After the join, the stream contains (Customer, Transaction) tuples.
         // We check for the non-existence of an alert based on the transaction's location.
-        .if_not_exists_on_indexed( // MODIFIED: Replaced `if_not_exists_bi` with `if_not_exists_on_indexed`
+        .if_not_exists_on_indexed(
             alerts_stream.clone(), // Reuse the alerts stream
             1,                     // Index of Transaction in the (Customer, Transaction) stream
             |tx: &Transaction| tx.location.clone(), // Key from the second fact (Transaction)
             |alert: &SecurityAlert| alert.location.clone(), // Key from the "other" stream
         )
-        .penalize(|_| SimpleScore::new(1000.0)); // MODIFIED: Removed string ID
+        .penalize(|_| SimpleScore::new(1000.0));
 
     // Build the session from all the defined constraints.
     builder.build()
@@ -251,7 +167,7 @@ fn generate_data(
     num_transactions: usize,
     num_locations: usize,
 ) -> (Vec<Customer>, Vec<Transaction>, Vec<SecurityAlert>) {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     // Generate locations
     let locations: Vec<String> = (0..num_locations)
@@ -262,12 +178,12 @@ fn generate_data(
     let customers: Vec<Customer> = (0..num_customers)
         .map(|i| Customer {
             id: i as i32,
-            risk_level: match rng.gen_range(0..3) {
+            risk_level: match rng.random_range(0..3) {
                 0 => RiskLevel::Low,
                 1 => RiskLevel::Medium,
                 _ => RiskLevel::High,
             },
-            status: if rng.gen_bool(0.95) {
+            status: if rng.random_bool(0.95) {
                 CustomerStatus::Active
             } else {
                 CustomerStatus::Inactive
@@ -279,9 +195,9 @@ fn generate_data(
     let transactions: Vec<Transaction> = (0..num_transactions)
         .map(|i| Transaction {
             id: i as i32,
-            customer_id: rng.gen_range(0..num_customers) as i32,
-            amount: rng.gen_range(1.0..50000.0), // Amount in dollars
-            location: locations[rng.gen_range(0..locations.len())].clone(),
+            customer_id: rng.random_range(0..num_customers) as i32,
+            amount: rng.random_range(1.0..50000.0), // Amount in dollars
+            location: locations[rng.random_range(0..locations.len())].clone(),
         })
         .collect();
 
@@ -292,7 +208,7 @@ fn generate_data(
         .into_iter()
         .map(|loc| SecurityAlert {
             location: loc.clone(),
-            severity: rng.gen_range(1..=5),
+            severity: rng.random_range(1..=5),
         })
         .collect();
 
