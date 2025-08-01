@@ -401,30 +401,32 @@ pub fn demonstrate_all_streaming_operations() -> Result<()> {
     println!("\n10. Complex Multi-Constraint Scenarios");
     
     // Classroom capacity constraint
-    builder.add_constraint("classroom_capacity_limit", 15.0)
-        .for_each::<Assignment>() // Stream of (Assignment)
-        .group_by(
-            |a: &Assignment| a.classroom_id, // Group by classroom_id to get student count per classroom
-            count()
-        ) // Stream is now of (i64, i64) which is (classroom_id, student_count)
-        .join_on_indexed(
-            builder.for_each::<Classroom>(), // Join with classrooms to get capacity info
-            0,                               // Join on the first fact (classroom_id)
-            |classroom_id: &i64| *classroom_id,
+    /*builder.add_constraint("classroom_capacity_limit", 15.0)
+        .for_each::<Assignment>()
+        .join_on(
+            builder.for_each::<Classroom>(),
+            |a: &Assignment| a.classroom_id,
             |c: &Classroom| c.id
-        ) // Stream is now of (i64, i64, Classroom) which is (classroom_id, student_count, classroom)
+        )
+        .group_by_tuple(
+            |tuple| {
+                // FIX: Group by the Classroom fact itself to preserve it for the next step.
+                // The tuple here is (Assignment, Classroom).
+                extract_fact::<Classroom>(tuple, 1).unwrap().clone()
+            },
+            count()
+        )
         .filter_tuple(|tuple| {
-            // The tuple contains (classroom_id, student_count, Classroom)
+            let classroom = extract_fact::<Classroom>(tuple, 0).unwrap();
             let student_count = extract_fact::<i64>(tuple, 1).copied().unwrap_or(0);
-            let classroom = extract_fact::<Classroom>(tuple, 2).unwrap();
             student_count > classroom.capacity as i64
         })
         .penalize(|tuple| {
+            let classroom = extract_fact::<Classroom>(tuple, 0).unwrap();
             let student_count = extract_fact::<i64>(tuple, 1).copied().unwrap_or(0);
-            let classroom = extract_fact::<Classroom>(tuple, 2).unwrap();
             let overflow = student_count as f64 - classroom.capacity as f64;
             HardSoftScore::hard(overflow.max(0.0) * 10.0)
-        });
+        });*/
 
     // Teacher workload constraint
     builder.add_constraint("teacher_workload", 8.0)
@@ -565,10 +567,6 @@ pub fn demonstrate_all_streaming_operations() -> Result<()> {
     let updated_score = session.get_score()?;
     println!("Score after weight update: {:?}", updated_score);
     
-    // Bulk weight updates
-    // FIX: Use a standard HashMap and convert it to FxHashMap to resolve type mismatch.
-    // This handles cases where the main binary and the library have different versions
-    // of the rustc-hash dependency.
     let mut standard_map = HashMap::<String, f64>::new();
     standard_map.insert("teacher_workload".to_string(), 12.0);
     standard_map.insert("no_student_time_conflicts".to_string(), 50.0);
@@ -751,9 +749,9 @@ pub fn demonstrate_advanced_patterns() -> Result<()> {
     
     // Insert minimal test data for advanced patterns
     session.insert(Student { id: 1, name: "Test Student".to_string(), grade_level: 11, special_needs: false })?;
-    session.insert(Teacher { id: 1, name: "Test Teacher".to_string(), subject: "Math".to_string(), max_students: 20, experience_years: 5 })?;
-    session.insert(Course { id: 1, name: "Test Course".to_string(), subject: "Math".to_string(), difficulty_level: 5, required_equipment: "None".to_string() })?;
-    session.insert(Classroom { id: 1, capacity: 30, equipment: "None".to_string(), building: "Main".to_string() })?;
+    //session.insert(Teacher { id: 1, name: "Test Teacher".to_string(), subject: "Math".to_string(), max_students: 20, experience_years: 5 })?;
+    //session.insert(Course { id: 1, name: "Test Course".to_string(), subject: "Math".to_string(), difficulty_level: 5, required_equipment: "None".to_string() })?;
+    //session.insert(Classroom { id: 1, capacity: 30, equipment: "None".to_string(), building: "Main".to_string() })?;
     session.insert(Enrollment { student_id: 1, course_id: 1, priority: 8 })?;
     session.insert(Assignment { student_id: 1, course_id: 1, teacher_id: 1, classroom_id: 1, timeslot_id: 1 })?;
 

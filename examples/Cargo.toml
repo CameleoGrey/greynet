@@ -1,8 +1,11 @@
 
 [workspace]
 resolver = "2"
-members = [ "individual_constraint_matching",
+members = [ 
+	"individual_constraint_matching",
     "stress_zero",
+	"demo_1",
+	"demo_2",
 ]
 
 [workspace.dependencies]
@@ -11,7 +14,7 @@ greynet = {path = "../greynet"}
 [profile.release]
 lto = true
 codegen-units = 1
-debug = true
+debug = false
 opt-level = 3
 #rustflags = ["-C", "target-cpu=native"]
 

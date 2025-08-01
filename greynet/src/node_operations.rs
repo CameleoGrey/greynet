@@ -16,6 +16,12 @@ impl NodeOperations {
         let mut flatmap_count = 0;
         let mut adapter_count = 0;
         let mut scoring_count = 0;
+        let mut distict_count = 0;
+        let mut union_count = 0;
+        let mut union_adapter_count = 0;
+        let mut map_count = 0;
+        let mut global_aggregate_count = 0;
+
 
         for (_, node) in nodes.nodes.iter() {
             match node {
@@ -27,6 +33,11 @@ impl NodeOperations {
                 NodeData::FlatMap(_) => flatmap_count += 1,
                 NodeData::JoinLeftAdapter(_) | NodeData::JoinRightAdapter(_) => adapter_count += 1,
                 NodeData::Scoring(_) => scoring_count += 1,
+                NodeData::Distinct(_) => distict_count += 1,
+                NodeData::Union(_) => union_count += 1,
+                NodeData::UnionAdapter(_) => union_adapter_count += 1,
+                NodeData::Map(_) => map_count += 1,
+                NodeData::GlobalAggregate(_) => global_aggregate_count += 1,
             }
         }
 
@@ -39,6 +50,11 @@ impl NodeOperations {
         stats.insert("flatmap_nodes".to_string(), flatmap_count);
         stats.insert("adapter_nodes".to_string(), adapter_count);
         stats.insert("scoring_nodes".to_string(), scoring_count);
+        stats.insert("distinct_nodes".to_string(), distict_count);
+        stats.insert("union_nodes".to_string(), union_count);
+        stats.insert("union_adapter_nodes".to_string(), union_adapter_count);
+        stats.insert("map_nodes".to_string(), map_count);
+        stats.insert("global_adapter_nodes".to_string(), global_aggregate_count);
         stats
     }
 }

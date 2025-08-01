@@ -1,9 +1,9 @@
-// nodes.rs
+// nodes.rs - Enhanced with new node types
 use super::advanced_index::AdvancedIndex;
 use super::arena::{NodeId, NodeOperation, SafeTupleIndex, TupleArena};
 use super::collectors::{BaseCollector, UndoReceipt};
 use super::joiner::JoinerType;
-use super::stream_def::CollectorSupplier;
+use super::stream_def::{CollectorSupplier, ZeroCopyTupleMapperFn};
 use super::tuple::BiTuple;
 use super::uni_index::UniIndex;
 use crate::constraint::ConstraintWeights;
@@ -18,6 +18,8 @@ use smallvec::SmallVec;
 use std::any::TypeId;
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 // --- Zero-Copy Function Type Definitions ---
 
@@ -72,6 +74,17 @@ pub struct MapperFn(pub ZeroCopyMapperFn);
 impl MapperFn {
     #[inline]
     fn execute(&self, tuple: &AnyTuple) -> Vec<Rc<dyn crate::fact::GreynetFact>> {
+        self.0(tuple)
+    }
+}
+
+/// NEW: A wrapper for tuple transformation functions
+#[derive(Clone)]
+pub struct TupleMapperFn(pub ZeroCopyTupleMapperFn);
+
+impl TupleMapperFn {
+    #[inline]
+    fn execute(&self, tuple: &AnyTuple) -> AnyTuple {
         self.0(tuple)
     }
 }
@@ -783,6 +796,329 @@ impl std::fmt::Debug for FlatMapNode {
     }
 }
 
+/// NEW: A node that transforms each incoming tuple into a single new tuple.
+pub struct MapNode {
+    pub children: Vec<NodeId>,
+    mapper_fn: TupleMapperFn,
+    parent_to_child_map: HashMap<SafeTupleIndex, SafeTupleIndex>,
+}
+
+impl MapNode {
+    pub fn new(mapper_fn: TupleMapperFn) -> Self {
+        Self {
+            children: Vec::new(),
+            mapper_fn,
+            parent_to_child_map: HashMap::default(),
+        }
+    }
+
+    pub fn insert_collect_ops(
+        &mut self,
+        parent_tuple_idx: SafeTupleIndex,
+        tuples: &mut TupleArena,
+        operations: &mut Vec<NodeOperation>,
+    ) -> Result<()> {
+        let parent_tuple = tuples.get_tuple_checked(parent_tuple_idx)?;
+        let new_tuple = self.mapper_fn.execute(parent_tuple);
+
+        let child_idx = tuples.acquire_tuple(new_tuple)?;
+        self.parent_to_child_map.insert(parent_tuple_idx, child_idx);
+        
+        for &child_id in self.children.iter() {
+            operations.push(NodeOperation::Insert(child_id, child_idx));
+        }
+        Ok(())
+    }
+
+    pub fn retract_collect_ops(
+        &mut self,
+        parent_tuple_idx: SafeTupleIndex,
+        _tuples: &mut TupleArena,
+        operations: &mut Vec<NodeOperation>,
+    ) -> Result<()> {
+        if let Some(child_idx) = self.parent_to_child_map.remove(&parent_tuple_idx) {
+            for &child_id in self.children.iter() {
+                operations.push(NodeOperation::Retract(child_id, child_idx));
+            }
+            operations.push(NodeOperation::ReleaseTuple(child_idx));
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for MapNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MapNode")
+            .field("children", &self.children)
+            .field("mapper_fn", &"<function>")
+            .finish()
+    }
+}
+
+/// NEW: A node that merges multiple streams into one.
+pub struct UnionNode {
+    pub children: Vec<NodeId>,
+    // Track which parent each tuple came from for proper retraction
+    tuple_source_map: HashMap<SafeTupleIndex, usize>,
+}
+
+impl UnionNode {
+    pub fn new() -> Self {
+        Self {
+            children: Vec::new(),
+            tuple_source_map: HashMap::default(),
+        }
+    }
+
+    pub fn insert_collect_ops(
+        &mut self,
+        tuple_index: SafeTupleIndex,
+        _tuples: &mut TupleArena,
+        operations: &mut Vec<NodeOperation>,
+        source_index: usize,
+    ) -> Result<()> {
+        self.tuple_source_map.insert(tuple_index, source_index);
+        for &child_id in &self.children {
+            operations.push(NodeOperation::Insert(child_id, tuple_index));
+        }
+        Ok(())
+    }
+
+    pub fn retract_collect_ops(
+        &mut self,
+        tuple_index: SafeTupleIndex,
+        _tuples: &mut TupleArena,
+        operations: &mut Vec<NodeOperation>,
+    ) -> Result<()> {
+        if self.tuple_source_map.remove(&tuple_index).is_some() {
+            for &child_id in &self.children {
+                operations.push(NodeOperation::Retract(child_id, tuple_index));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for UnionNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnionNode")
+            .field("children", &self.children)
+            .field("tracked_tuples", &self.tuple_source_map.len())
+            .finish()
+    }
+}
+
+/// NEW: A node that ensures only unique tuples pass through.
+pub struct DistinctNode {
+    pub children: Vec<NodeId>,
+    // Use a hash-based approach for detecting duplicates
+    seen_tuples: HashMap<u64, Vec<SafeTupleIndex>>,
+    tuple_to_hash: HashMap<SafeTupleIndex, u64>,
+}
+
+impl DistinctNode {
+    pub fn new() -> Self {
+        Self {
+            children: Vec::new(),
+            seen_tuples: HashMap::default(),
+            tuple_to_hash: HashMap::default(),
+        }
+    }
+
+    fn compute_tuple_hash(tuple: &AnyTuple) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        for fact in tuple.facts_iter() {
+            fact.hash_fact().hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    pub fn insert_collect_ops(
+        &mut self,
+        tuple_index: SafeTupleIndex,
+        tuples: &mut TupleArena,
+        operations: &mut Vec<NodeOperation>,
+    ) -> Result<()> {
+        let tuple = tuples.get_tuple_checked(tuple_index)?;
+        let hash = Self::compute_tuple_hash(tuple);
+        
+        let is_duplicate = self.seen_tuples
+            .get(&hash)
+            .map_or(false, |indices| !indices.is_empty());
+
+        self.seen_tuples.entry(hash).or_default().push(tuple_index);
+        self.tuple_to_hash.insert(tuple_index, hash);
+
+        // Only propagate if this is the first occurrence
+        if !is_duplicate {
+            for &child_id in &self.children {
+                operations.push(NodeOperation::Insert(child_id, tuple_index));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn retract_collect_ops(
+        &mut self,
+        tuple_index: SafeTupleIndex,
+        _tuples: &mut TupleArena,
+        operations: &mut Vec<NodeOperation>,
+    ) -> Result<()> {
+        if let Some(hash) = self.tuple_to_hash.remove(&tuple_index) {
+            if let Some(indices) = self.seen_tuples.get_mut(&hash) {
+                let was_first = indices.first() == Some(&tuple_index);
+                indices.retain(|&idx| idx != tuple_index);
+                
+                if was_first {
+                    // We're removing the first occurrence, propagate the retraction
+                    for &child_id in &self.children {
+                        operations.push(NodeOperation::Retract(child_id, tuple_index));
+                    }
+                    
+                    // If there are more occurrences, propagate the next one
+                    if let Some(&next_index) = indices.first() {
+                        for &child_id in &self.children {
+                            operations.push(NodeOperation::Insert(child_id, next_index));
+                        }
+                    }
+                }
+                
+                if indices.is_empty() {
+                    self.seen_tuples.remove(&hash);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for DistinctNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DistinctNode")
+            .field("children", &self.children)
+            .field("unique_hashes", &self.seen_tuples.len())
+            .finish()
+    }
+}
+
+/// NEW: A node that performs global aggregation on all tuples.
+pub struct GlobalAggregateNode {
+    pub children: Vec<NodeId>,
+    collector_supplier: CollectorSupplier,
+    collector: Option<Box<dyn BaseCollector>>,
+    tuple_to_receipt: HashMap<SafeTupleIndex, UndoReceipt>,
+    current_result_tuple: Option<SafeTupleIndex>,
+}
+
+impl GlobalAggregateNode {
+    pub fn new(collector_supplier: CollectorSupplier) -> Self {
+        Self {
+            children: Vec::new(),
+            collector_supplier,
+            collector: None,
+            tuple_to_receipt: HashMap::default(),
+            current_result_tuple: None,
+        }
+    }
+
+    pub fn insert_collect_ops(
+        &mut self,
+        tuple_index: SafeTupleIndex,
+        tuples: &mut TupleArena,
+        operations: &mut Vec<NodeOperation>,
+    ) -> Result<()> {
+        let parent_tuple = tuples.get_tuple_checked(tuple_index)?;
+        
+        // Initialize collector if needed
+        if self.collector.is_none() {
+            self.collector = Some(self.collector_supplier.create());
+        }
+        
+        let receipt = self.collector.as_mut().unwrap().insert(parent_tuple);
+        self.tuple_to_receipt.insert(tuple_index, receipt);
+        
+        self.update_or_create_result(tuples, operations)?;
+        Ok(())
+    }
+
+    pub fn retract_collect_ops(
+        &mut self,
+        tuple_index: SafeTupleIndex,
+        tuples: &mut TupleArena,
+        operations: &mut Vec<NodeOperation>,
+    ) -> Result<()> {
+        if let Some(receipt) = self.tuple_to_receipt.remove(&tuple_index) {
+            let parent_tuple = tuples.get_tuple_checked(tuple_index)?;
+            if let Some(collector) = self.collector.as_mut() {
+                collector.remove(parent_tuple, receipt);
+            }
+            
+            if self.collector.as_ref().map_or(true, |c| c.is_empty()) {
+                // Remove the result tuple if collector is empty
+                if let Some(result_index) = self.current_result_tuple.take() {
+                    for &child_id in &self.children {
+                        operations.push(NodeOperation::Retract(child_id, result_index));
+                    }
+                    operations.push(NodeOperation::ReleaseTuple(result_index));
+                }
+            } else {
+                self.update_or_create_result(tuples, operations)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn update_or_create_result(
+        &mut self,
+        tuples: &mut TupleArena,
+        operations: &mut Vec<NodeOperation>,
+    ) -> Result<()> {
+        let new_result_fact = if let Some(collector) = self.collector.as_ref() {
+            collector.result_as_fact()
+        } else {
+            return Ok(());
+        };
+
+        // Check if we need to update
+        if let Some(old_result_index) = self.current_result_tuple {
+            let old_tuple = tuples.get_tuple_checked(old_result_index)?;
+            let old_result_fact = match old_tuple {
+                AnyTuple::Uni(t) => &t.fact_a,
+                _ => return Err(GreynetError::type_mismatch("GlobalAggregateNode result should be UniTuple")),
+            };
+
+            if old_result_fact.eq_fact(&*new_result_fact) {
+                return Ok(());
+            }
+
+            // Retract old result
+            for &child_id in &self.children {
+                operations.push(NodeOperation::Retract(child_id, old_result_index));
+            }
+            operations.push(NodeOperation::ReleaseTuple(old_result_index));
+        }
+
+        // Create new result
+        let new_result_tuple = AnyTuple::Uni(crate::tuple::UniTuple::new(new_result_fact));
+        let new_result_index = tuples.acquire_tuple(new_result_tuple)?;
+        self.current_result_tuple = Some(new_result_index);
+
+        for &child_id in &self.children {
+            operations.push(NodeOperation::Insert(child_id, new_result_index));
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for GlobalAggregateNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GlobalAggregateNode")
+            .field("children", &self.children)
+            .field("has_collector", &self.collector.is_some())
+            .field("tuple_count", &self.tuple_to_receipt.len())
+            .finish()
+    }
+}
 
 /// A terminal node that calculates a score for each tuple that reaches it.
 pub struct ScoringNode<S: Score> {

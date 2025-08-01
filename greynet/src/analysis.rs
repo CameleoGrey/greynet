@@ -63,6 +63,11 @@ impl ConstraintAnalysis {
                 NodeData::Scoring(_) => "Scoring",
                 NodeData::JoinLeftAdapter(_) => "JoinLeftAdapter",
                 NodeData::JoinRightAdapter(_) => "JoinRightAdapter",
+                NodeData::Distinct(_) => "Distinct",
+                NodeData::Union(_) => "Union",
+                NodeData::UnionAdapter(_) => "UnionAdapter",
+                NodeData::Map(_) => "Map",
+                NodeData::GlobalAggregate(_) => "GlobalAggregate",
             };
             *stats.node_type_counts.entry(node_type.to_string()).or_insert(0) += 1;
         }

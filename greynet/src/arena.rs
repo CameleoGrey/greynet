@@ -1,8 +1,10 @@
-// arena.rs
+// arena.rs - Enhanced with new node support
 
 use crate::join_adapters::*;
+use crate::factory::UnionAdapter;  // NEW
 use crate::nodes::{
     ConditionalNode, FilterNode, FlatMapNode, FromNode, GroupNode, JoinNode, ScoringNode,
+    MapNode, UnionNode, DistinctNode, GlobalAggregateNode  // NEW nodes
 };
 use crate::score::Score;
 use crate::state::TupleState;
@@ -232,6 +234,8 @@ pub enum NodeOperation {
     InsertRight(NodeId, SafeTupleIndex),
     RetractLeft(NodeId, SafeTupleIndex),
     RetractRight(NodeId, SafeTupleIndex),
+    InsertUnion(NodeId, SafeTupleIndex, usize),  // NEW: Union with source index
+    RetractUnion(NodeId, SafeTupleIndex),        // NEW: Union retract
     ReleaseTuple(SafeTupleIndex),
 }
 
@@ -244,8 +248,13 @@ pub enum NodeData<S: Score> {
     Conditional(ConditionalNode),
     JoinLeftAdapter(JoinLeftAdapter),
     JoinRightAdapter(JoinRightAdapter),
+    UnionAdapter(UnionAdapter),  // NEW
     Group(GroupNode),
     FlatMap(FlatMapNode),
+    Map(MapNode),              // NEW
+    Union(UnionNode),          // NEW
+    Distinct(DistinctNode),    // NEW
+    GlobalAggregate(GlobalAggregateNode),  // NEW
     Scoring(ScoringNode<S>),
 }
 
@@ -263,6 +272,13 @@ impl<S: Score> NodeData<S> {
             NodeData::Filter(node) => node.insert_collect_ops(tuple_index, tuples, operations),
             NodeData::Group(node) => node.insert_collect_ops(tuple_index, tuples, operations),
             NodeData::FlatMap(node) => node.insert_collect_ops(tuple_index, tuples, operations),
+            NodeData::Map(node) => node.insert_collect_ops(tuple_index, tuples, operations),
+            NodeData::Union(node) => {
+                // Union nodes need special handling with source index, this is handled by adapters
+                node.insert_collect_ops(tuple_index, tuples, operations, 0)
+            }
+            NodeData::Distinct(node) => node.insert_collect_ops(tuple_index, tuples, operations),
+            NodeData::GlobalAggregate(node) => node.insert_collect_ops(tuple_index, tuples, operations),
             NodeData::Join(_) | NodeData::Conditional(_) => Ok(()), // Handled by adapters
             NodeData::JoinLeftAdapter(adapter) => {
                 operations.push(NodeOperation::InsertLeft(
@@ -275,6 +291,14 @@ impl<S: Score> NodeData<S> {
                 operations.push(NodeOperation::InsertRight(
                     adapter.parent_join_node,
                     tuple_index,
+                ));
+                Ok(())
+            }
+            NodeData::UnionAdapter(adapter) => {
+                operations.push(NodeOperation::InsertUnion(
+                    adapter.parent_union_node,
+                    tuple_index,
+                    adapter.source_index,
                 ));
                 Ok(())
             }
@@ -295,6 +319,10 @@ impl<S: Score> NodeData<S> {
             NodeData::Filter(node) => node.retract_collect_ops(tuple_index, tuples, operations),
             NodeData::Group(node) => node.retract_collect_ops(tuple_index, tuples, operations),
             NodeData::FlatMap(node) => node.retract_collect_ops(tuple_index, tuples, operations),
+            NodeData::Map(node) => node.retract_collect_ops(tuple_index, tuples, operations),
+            NodeData::Union(node) => node.retract_collect_ops(tuple_index, tuples, operations),
+            NodeData::Distinct(node) => node.retract_collect_ops(tuple_index, tuples, operations),
+            NodeData::GlobalAggregate(node) => node.retract_collect_ops(tuple_index, tuples, operations),
             NodeData::Join(_) | NodeData::Conditional(_) => Ok(()), // Handled by adapters
             NodeData::JoinLeftAdapter(adapter) => {
                 operations.push(NodeOperation::RetractLeft(
@@ -306,6 +334,13 @@ impl<S: Score> NodeData<S> {
             NodeData::JoinRightAdapter(adapter) => {
                 operations.push(NodeOperation::RetractRight(
                     adapter.parent_join_node,
+                    tuple_index,
+                ));
+                Ok(())
+            }
+            NodeData::UnionAdapter(adapter) => {
+                operations.push(NodeOperation::RetractUnion(
+                    adapter.parent_union_node,
                     tuple_index,
                 ));
                 Ok(())
@@ -323,9 +358,13 @@ impl<S: Score> NodeData<S> {
             NodeData::Conditional(n) => &mut n.children,
             NodeData::Group(n) => &mut n.children,
             NodeData::FlatMap(n) => &mut n.children,
+            NodeData::Map(n) => &mut n.children,
+            NodeData::Union(n) => &mut n.children,
+            NodeData::Distinct(n) => &mut n.children,
+            NodeData::GlobalAggregate(n) => &mut n.children,
             // Scoring and Adapter nodes are terminal or have special connections
             NodeData::Scoring(_) => return,
-            NodeData::JoinLeftAdapter(_) | NodeData::JoinRightAdapter(_) => return,
+            NodeData::JoinLeftAdapter(_) | NodeData::JoinRightAdapter(_) | NodeData::UnionAdapter(_) => return,
         };
         if !children.contains(&child_id) {
             children.push(child_id);
@@ -436,6 +475,21 @@ impl<S: Score> NodeArena<S> {
                             n.retract_right_collect_ops(tuple_index, tuples, &mut new_operations)
                         } else if let Some(NodeData::Conditional(n)) = nodes.get_node_mut(node_id) {
                             n.retract_right_collect_ops(tuple_index, tuples, &mut new_operations)
+                        } else {
+                            Ok(())
+                        }
+                    }
+                    // NEW: Union operations
+                    NodeOperation::InsertUnion(node_id, tuple_index, source_index) => {
+                        if let Some(NodeData::Union(n)) = nodes.get_node_mut(node_id) {
+                            n.insert_collect_ops(tuple_index, tuples, &mut new_operations, source_index)
+                        } else {
+                            Ok(())
+                        }
+                    }
+                    NodeOperation::RetractUnion(node_id, tuple_index) => {
+                        if let Some(NodeData::Union(n)) = nodes.get_node_mut(node_id) {
+                            n.retract_collect_ops(tuple_index, tuples, &mut new_operations)
                         } else {
                             Ok(())
                         }
