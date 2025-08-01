@@ -3,7 +3,6 @@ use std::any::Any;
 use std::collections::hash_map::DefaultHasher;
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
-use uuid::Uuid;
 
 /// Core trait for all facts in the Greynet system.
 ///

@@ -5,7 +5,6 @@ use crate::tuple::AnyTuple;
 use std::any::Any;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use uuid::Uuid;
 
 
 #[macro_export]
