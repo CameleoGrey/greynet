@@ -128,4 +128,4 @@ You define rules using a fluent API (`ConstraintBuilder`), which translates your
 
 9. You can query the session for the total score or for the specific employees who violated the constraint.
 
-### [More documentation](https://github.com/CameleoGrey/greynet/docs)
+### [More documentation](https://github.com/CameleoGrey/greynet/tree/main/docs)
